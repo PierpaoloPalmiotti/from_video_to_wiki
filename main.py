@@ -1164,7 +1164,7 @@ class App(ctk.CTk):
 
         self.size_entry = ctk.CTkEntry(row_split, width=70, justify="center")
         self.size_entry.pack(side="left", padx=(0, 5))
-        self.size_entry.insert(0, "3")
+        self.size_entry.insert(0, "5")
 
         ctk.CTkLabel(
             row_split, text="(es. 25 = ~25 MB)",

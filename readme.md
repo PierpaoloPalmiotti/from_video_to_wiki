@@ -56,7 +56,7 @@ python --version
 Se non è installato:
 
 - **Windows**: scarica da [python.org/downloads](https://www.python.org/downloads/). Durante l'installazione **spunta "Add Python to PATH"**.
-- **macOS**: `brew install python` oppure scarica da [python.org](https://www.python.org/downloads/)
+- **macOS**: `brew install python@3.12 python-tk@3.12` oppure scarica da [python.org](https://www.python.org/downloads/) (l'installer include Tk). ⚠️ **Non usare il Python di Apple** (quello delle Command Line Tools, `/Library/Developer/CommandLineTools`): include Tk 8.5 e la GUI si apre con la **finestra bianca**. Serve Tk ≥ 8.6 — vedi [Utilizzo su macOS](#-utilizzo-su-macos).
 - **Linux (Ubuntu/Debian)**: `sudo apt update && sudo apt install python3 python3-pip python3-venv`
 
 ### 2. FFmpeg
@@ -139,6 +139,54 @@ source venv/bin/activate
 # 4. Installa le dipendenze base
 pip install -r requirements.txt
 ```
+
+### 🍎 Utilizzo su macOS
+
+Su Mac l'app funziona, ma con alcune differenze rispetto a Windows/Linux con GPU NVIDIA.
+
+**Installazione consigliata (Apple Silicon e Intel):**
+
+```bash
+# 1. Python con Tk 8.6+ e FFmpeg
+brew install python@3.12 python-tk@3.12 ffmpeg
+
+# 2. Verifica la versione di Tk (deve essere >= 8.6, non 8.5)
+/opt/homebrew/bin/python3.12 -c "import tkinter; print(tkinter.TkVersion)"
+
+# 3. Virtual environment con quel Python
+cd from_video_to_wiki
+/opt/homebrew/bin/python3.12 -m venv venv
+source venv/bin/activate
+
+# 4. Dipendenze (senza torch e senza requirements-gpu.txt) + av compatibile
+pip install customtkinter moviepy faster-whisper "av<17"
+
+# 5. Avvio
+python main.py
+```
+
+**Cosa cambia su Mac:**
+
+- **FFmpeg**: `ffmpeg.exe` nella cartella del progetto è un binario Windows e su Mac non viene usato. L'app usa `ffmpeg` dal PATH, quindi serve `brew install ffmpeg`.
+- **Device**: lascia **`auto`** (diventa CPU con `int8`). `cuda` non esiste su Mac e faster-whisper non supporta la GPU Apple (Metal/MPS), quindi la GPU del Mac non viene sfruttata.
+- **`requirements-gpu.txt`**: ignoralo, è solo per NVIDIA.
+- **`torch`**: su Mac non serve (nessuna GPU CUDA da rilevare) e pesa circa 2 GB. L'app lo gestisce comunque se manca e usa la CPU.
+- **Precisione**: il tipo di calcolo su CPU è fisso a `int8`. Per Whisper la perdita di qualità rispetto a `float32` è minima, mentre `float32` userebbe circa 4 volte la memoria e sarebbe più lento. Per migliorare i risultati è più efficace forzare la lingua (`it`) che cambiare precisione.
+- **Font del log**: il font `Consolas` non esiste su Mac, Tk ne usa uno di default. È solo estetico.
+
+**Modello consigliato su Mac:**
+
+| Mac | Modello |
+|---|---|
+| Prima prova per verificare che tutto funzioni | `small` |
+| Uso reale (≥ 16 GB di RAM) | `large-v3-turbo` |
+| 8 GB di RAM o poco tempo a disposizione | `medium` |
+
+**Prestazioni misurate (MacBook M5 Pro, 24 GB, `large-v3-turbo`, CPU int8):** 118 min di audio trascritti in circa 55 minuti, cioè **~2,2x tempo reale**. Su un video `.mov` da 460 MB (registrazione schermo) il tempo end-to-end è stato di circa **7 sec/MB**.
+
+> 💡 **Segmenti**: con "Max MB/segmento" = 3 una registrazione lunga produce centinaia di segmenti (398 nel test sopra). Per registrazioni lunghe alza il valore a 10-25 MB.
+
+> 💡 **Per sfruttare la GPU Apple** servirebbe un backend diverso, come [MLX Whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper): l'app oggi non lo supporta.
 
 ### Installazione opzionale per GPU NVIDIA
 
@@ -396,6 +444,7 @@ Sulla GPU il fattore di velocità rispetto alla CPU supera le **~200x** grazie a
 | CPU (i7/Ryzen 7, int8) | ~20 | ~1h 7min | ~5h 41min |
 | CPU (i9/Ryzen 9, int8) | ~14 | ~47 min | ~4h |
 | MacBook Pro M3 Pro (int8) | ~12 | ~40 min | ~3h 25min |
+| **MacBook M5 Pro 24 GB (int8, misurato)** | **~7** | **~23 min** | **~2h** |
 | **GPU (RTX 4060, float16 — misurato)** | **~0.09** | **~18 sec** | **~1.5 min** |
 
 > ⭐ La riga **RTX 4060** è un **benchmark reale end-to-end** con `large-v3-turbo`. GPU di fascia superiore (4070/4090) sono attese ancora più rapide. Le righe CPU/Apple sono indicative.
@@ -433,6 +482,10 @@ Sulla GPU il fattore di velocità rispetto alla CPU supera le **~200x** grazie a
 | L'app si chiudeva dopo la trascrizione GPU | Risolto: ora c'è un cleanup deterministico della cache CUDA prima del messagebox finale, l'app resta aperta. |
 | Allucinazioni nel testo | Il filtro VAD è attivo di default. Se persistono, prova `--lingua it` per forzare la lingua |
 | La trascrizione non riprende dal punto giusto | Verifica che `_progresso.json` sia presente nella cartella dei segmenti. Se corrotto, eliminalo per ripartire da zero |
+| **macOS**: la finestra dell'app è bianca / vuota | Stai usando un Python con Tk 8.5 (tipicamente quello di Apple in `/Library/Developer/CommandLineTools`). Verifica con `python -c "import tkinter; print(tkinter.TkVersion)"`: serve ≥ 8.6. Ricrea il venv con Python da Homebrew (`python@3.12` + `python-tk@3.12`) o da python.org. |
+| **macOS**: `FFmpeg non trovato` | `ffmpeg.exe` è per Windows. Installa `brew install ffmpeg` e riavvia il terminale. |
+| `open() got an unexpected keyword argument 'metadata_errors'` su ogni segmento | Incompatibilità tra `faster-whisper` e una versione recente di `av` (PyAV 19). Esegui `pip install "av<17"`. Fino alla correzione l'app può mostrare "Completato" con trascrizione vuota (0 segmenti trascritti). |
+| I segmenti `.wav` non vengono eliminati a fine trascrizione | La pulizia avviene solo se almeno un segmento è stato trascritto con successo e la trascrizione non è stata interrotta. Se nel report vedi "Segmenti trascritti: 0/N" c'è un errore a monte (controlla il file in `logs/`): i `.wav` restano apposta, così puoi ritrascrivere con **📂 Trascrivi da Cartella...** senza rifare lo splitting. |
 | Il batch non rigenera i `.md` in `raw/` | Assicurati che la spunta **Genera struttura LLM Wiki** sia attiva prima di avviare il batch |
 
 ---

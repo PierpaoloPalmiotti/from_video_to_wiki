@@ -46,3 +46,10 @@ desktop.ini
 
 # Log
 logs/
+# Skill / configurazione agenti (locali, non versionati)
+.agents/
+.claude/
+skills-lock.json
+
+# Il .gitignore stesso (resta solo in locale)
+.gitignore

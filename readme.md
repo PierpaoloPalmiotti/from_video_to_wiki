@@ -39,7 +39,14 @@ In più, può elaborare **un'intera cartella di video in batch** e generare lo s
 - **Pausa e Stop durante l'esecuzione**: pulsanti ⏸ e ⏹ accessibili dal log; allo stop viene generato comunque il file di trascrizione parziale con quanto elaborato fino a quel momento
 - **Filtro VAD** integrato contro le allucinazioni nei silenzi
 - **Output flessibile**: testo semplice o dettagliato con timestamp, con report completo delle metriche
-- **Interfaccia moderna** con CustomTkinter (dark/light) + modalità CLI standalone (`transcriber.py`)
+- **Sintesi con LLM open source in locale**: la trascrizione viene passata a un modello locale (Qwen3, Llama 3.1, Gemma 3, Mistral Nemo, Phi-4, gpt-oss…) via [Ollama](https://ollama.com/) o HuggingFace GGUF (llama.cpp) e trasformata in una **nota `.md`** strutturata in base al tipo di registrazione (standup, riunione, lezione da studiare, talk, intervista, brainstorming…)
+- **Gestione esplicita della finestra di contesto**: contesto adattato al testo, misurazione dei token e **map-reduce** automatico per registrazioni lunghe (niente troncamenti silenziosi)
+- **Download automatico dei modelli** al primo utilizzo (Ollama o HuggingFace), con avanzamento nel log
+- **Knowledge base che cresce**: ogni nota può essere archiviata in una Wiki (sorgente in `raw/`, sintesi, pagine concetto/entità collegate, `index.md`, `log.md`); il "cervello" LLM può fare l'ingest di intere cartelle e **rispondere a domande** sulla Wiki, archiviando le risposte
+- **Thread CPU configurabili** per Whisper e per l'LLM, accelerazione GPU o *solo CPU*: per sfruttare tutti i core e fare **test di performance** confrontabili
+- **Log di performance**: intestazione hardware in ogni log, velocità per segmento (x tempo reale), tok/s di lettura prompt e generazione, quota del modello su GPU e una riga per test in `logs/performance.csv`
+- **macOS e Windows** con lo stesso codice: rilevamento hardware nativo, finestra adattiva allo scaling DPI di Windows, nessuna console che lampeggia
+- **Interfaccia moderna** con CustomTkinter (dark/light), impostazioni ricordate tra un avvio e l'altro + modalità CLI standalone (`transcriber.py`)
 
 ---
 
@@ -140,6 +147,15 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
+### 🧠 LLM locale per le note (opzionale ma consigliato)
+
+Per generare le note `.md` e lavorare con la Wiki serve un LLM locale. Due opzioni:
+
+- **Ollama (consigliato)** — installa da [ollama.com/download](https://ollama.com/download). Nessun pacchetto Python aggiuntivo: l'app avvia Ollama se non è attivo e **scarica da sola** il modello scelto al primo utilizzo (oppure con **⬇ Scarica**).
+- **HuggingFace GGUF via llama.cpp** — `pip install -r requirements-hf.txt`, poi scegli un modello `· HuggingFace`. Il file GGUF viene scaricato nella cache di HuggingFace (`~/.cache/huggingface/`).
+
+Senza LLM l'app continua a funzionare come prima: basta togliere la spunta **🧠 Genera nota .md con LLM**.
+
 ### 🍎 Utilizzo su macOS
 
 Su Mac l'app funziona, ma con alcune differenze rispetto a Windows/Linux con GPU NVIDIA.
@@ -232,19 +248,22 @@ huggingface-cli download Systran/faster-whisper-medium
 from_video_to_wiki/
 │
 ├── main.py                  # Applicazione GUI (CustomTkinter)
+├── llm_engine.py            # Sintesi LLM locale (Ollama / HuggingFace), contesto, Wiki
+├── perf.py                  # Info di sistema (CPU/RAM/GPU) e logs/performance.csv
 ├── transcriber.py           # Modulo CLI standalone per trascrizione
 ├── requirements.txt         # Dipendenze base (CPU)
 ├── requirements-gpu.txt     # Dipendenze opzionali per GPU NVIDIA
+├── requirements-hf.txt      # Dipendenze opzionali per LLM HuggingFace (llama.cpp)
 ├── readme.md                # Documentazione
 ├── LICENSE                  # Licenza MIT
-├── .gitignore               # File e cartelle esclusi da Git
+├── .gitignore               # Esclusioni Git (solo locale, non versionato)
 │
 ├── ffmpeg.exe               # ⚠️ Solo Windows, opzionale (vedi nota sotto)
 │
 └── venv/                    # Virtual environment (generato, non versionato)
 ```
 
-> ⚠️ **ffmpeg.exe**: su Windows puoi copiare `ffmpeg.exe` direttamente nella cartella del progetto come alternativa all'installazione globale nel PATH. Su macOS e Linux, FFmpeg va installato a livello di sistema (vedi [Prerequisiti](#-prerequisiti)). Il file è escluso dal repository tramite `.gitignore`.
+> ⚠️ **ffmpeg.exe**: su Windows puoi copiare `ffmpeg.exe` direttamente nella cartella del progetto come alternativa all'installazione globale nel PATH. Su macOS e Linux, FFmpeg va installato a livello di sistema (vedi [Prerequisiti](#-prerequisiti)). Il file non va versionato.
 
 > 💡 **venv/** e i modelli Whisper (salvati in `~/.cache/huggingface/`) non sono inclusi nel repository. Vengono generati localmente durante l'installazione e il primo avvio.
 
@@ -259,9 +278,12 @@ cartella_video/
     ├── intervista_segmento_1.wav             # Eliminati automaticamente dopo
     ├── intervista_segmento_2.wav             # la trascrizione completata
     ├── intervista_segmento_3.wav             #
-    ├── intervista_trascrizione.txt           # Output finale
+    ├── intervista_trascrizione.txt           # Trascrizione
+    ├── intervista_nota.md                    # Nota LLM (se la spunta è attiva)
     └── _progresso.json                       # Checkpoint (rimosso a completamento)
 ```
+
+> 💡 Le impostazioni (modelli, parametri, cartella della knowledge base) vengono ricordate in `~/.from_video_to_wiki/settings.json`.
 
 > 💡 I file audio segmentati vengono **eliminati automaticamente** al termine di una trascrizione completata con successo. In caso di interruzione, i file restano e `_progresso.json` tiene traccia di quanto già trascritto per permettere la ripresa.
 
@@ -275,29 +297,25 @@ cartella_video/
 python main.py
 ```
 
-1. Clicca **📁 Sfoglia** e seleziona un video
-2. Imposta la dimensione massima per segmento (in MB)
-3. Scegli una delle due modalità:
-   - **▶ Elabora Video** — esegue solo lo splitting audio
-   - **⚡ Elabora + Trascrivi** — esegue splitting e trascrizione in sequenza con un solo click
-4. Se hai usato solo **Elabora Video**, clicca **🎙 Trascrivi Segmenti** per avviare la trascrizione manualmente
-5. Imposta **Device** su `auto` (default), `cpu` o `cuda` in base alla tua macchina
-6. La trascrizione viene salvata come `{nome_video}_trascrizione.txt` nella cartella del video
+L'interfaccia è organizzata in tre blocchi, dall'alto verso il basso:
 
-Durante splitting e trascrizione compaiono i pulsanti **⏸ Pausa** e **⏹ Stop** nel pannello log. Allo stop viene generato comunque il file di trascrizione con quanto elaborato fino a quel momento — potrai riprendere in seguito dallo stesso punto.
+**1 │ Impostazioni** — da configurare per prime, valgono per tutto il resto:
+- *Trascrizione*: modello Whisper, lingua, formato (`txt`/`dettagliato`), device (`auto`/`cpu`/`cuda`), MB per segmento, **thread CPU**
+- *Sintesi LLM*: modello (menu a tendina con catalogo Ollama/HuggingFace, modelli già installati in Ollama e **✏️ Personalizzato…**), **tipo di contenuto** (Auto, Standup/Daily, Riunione/Call, Lezione/Studio, Webinar/Talk, Intervista, Brainstorming, Riassunto generico), lingua della nota, **contesto**, **max output**, **temperatura**, **thread LLM** e **accelerazione** (GPU o solo CPU). La riga informativa mostra stato del modello (installato / da scaricare), dimensione, contesto massimo, stima della RAM per la KV cache e un avviso se il modello non sta in memoria
 
-A fine trascrizione vedrai nel log:
+> 💡 Accanto a ogni parametro c'è un'icona **ⓘ**: passandoci sopra con il mouse (o cliccandola) compare una spiegazione breve di cosa fa.
 
-```
-🧹 Risorse modello liberate
-📋 REPORT FINALE END-TO-END
-   ...
-🟢 App pronta — puoi consultare i log o avviare un'altra trascrizione.
-```
+**2 │ Singolo contenuto** — estrai → trascrivi → nota:
+1. Seleziona il video con **📁**
+2. (Opzionale) scegli una **Knowledge base**: la nota verrà anche archiviata nella Wiki, che cresce a ogni contenuto
+3. Lascia attiva **🧠 Genera nota .md con LLM** e clicca **⚡ Elabora + Trascrivi + Nota**
+4. Altre azioni: **▶ Solo estrai audio**, **🎙 Trascrivi segmenti**, **📂 Da cartella audio…** (anche queste generano la nota se la spunta è attiva) e **📝 Nota da trascrizione…** per creare la nota da un `.txt` già esistente
 
-Il messaggio finale conferma che la cache GPU è stata svuotata correttamente e che l'app è pronta per un nuovo lavoro.
+**3 │ Knowledge Base** — cartella → LLM Wiki (vedi [Batch & LLM Wiki](#-batch--llm-wiki)), con un **Cervello Wiki** selezionabile (anche diverso dal modello delle note)
 
-Puoi anche usare **📂 Trascrivi da Cartella...** per trascrivere file audio già esistenti senza passare dallo splitting.
+Durante l'esecuzione compaiono **⏸ Pausa** e **⏹ Stop** nel pannello log. Allo stop viene generato comunque il file di trascrizione con quanto elaborato fino a quel momento; durante la fase LLM lo stop interrompe la generazione in corso (la trascrizione resta salvata e la nota si può rigenerare con **📝 Nota da trascrizione…**).
+
+A fine elaborazione il log riporta il report end-to-end, le statistiche LLM (token in/out, tok/s, eventuali avvisi di troncamento) e i percorsi di trascrizione, nota e pagina Wiki.
 
 ### Riga di comando (CLI)
 
@@ -329,6 +347,7 @@ python transcriber.py /percorso/cartella_audio/ --output risultato.txt
 | `--formato` | `txt` | `txt` o `dettagliato` |
 | `--output` | `trascrizione.txt` | Percorso file di output |
 | `--no-vad` | disattivato | Disabilita il filtro anti-allucinazioni |
+| `--cpu-threads` | `0` (= 4) | Thread CPU usati da faster-whisper |
 
 ---
 
@@ -336,15 +355,21 @@ python transcriber.py /percorso/cartella_audio/ --output risultato.txt
 
 Oltre al singolo video, l'app può elaborare **un'intera cartella** e produrre lo scaffold di una **LLM Wiki** — una base di conoscenza in markdown che un coding agent (Claude Code, OpenCode, ecc.) può poi popolare e mantenere, navigabile in [Obsidian](https://obsidian.md/).
 
-L'idea segue il pattern [LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f): l'app fa ciò in cui eccelle (trascrivere in batch) e prepara il terreno; la wiki vera la costruisce l'agente. **Nessuna chiamata LLM è inclusa nell'app**: l'integrazione è gestita esternamente, così lo strumento resta 100% offline e senza costi ricorrenti.
+L'idea segue il pattern [LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f): la conoscenza non viene riscoperta a ogni domanda, ma **compilata una volta e tenuta aggiornata**. L'app trascrive in batch e, se lo desideri, usa un **LLM locale come "cervello"** per fare un primo ingest della Wiki; un coding agent può poi rifinirla. Tutto resta 100% offline e senza costi ricorrenti.
 
 ### Come si usa
 
 1. Nella sezione **3 │ Batch Cartella → LLM Wiki** clicca **📁 Sfoglia** e seleziona la cartella che contiene i video
-2. Lascia attiva la spunta **Genera struttura LLM Wiki** (impostazioni modello/lingua/formato/device condivise con la modalità a singolo video)
-3. Clicca **🚀 Elabora Cartella + Wiki**
+2. Scegli il **Cervello Wiki** (di default lo stesso modello delle Impostazioni) e il **tipo di contenuto** nelle Impostazioni (es. *Lezione / Studio* per una cartella di lezioni)
+3. Lascia attive **Genera struttura Wiki** e **🧠 Ingest automatico con LLM**
+4. Clicca **🚀 Elabora Cartella + Wiki**
 
-L'app elabora in sequenza tutti i video riconosciuti (MP4, AVI, MOV, MKV, ecc.): per ciascuno estrae l'audio, segmenta e trascrive. Il modello Whisper viene **caricato una sola volta** e riusato per tutti i file. Il progresso è salvato a livello di cartella, quindi un batch interrotto **riparte** dai video non ancora completati.
+L'app elabora in sequenza tutti i video riconosciuti (MP4, AVI, MOV, MKV, ecc.): per ciascuno estrae l'audio, segmenta e trascrive. Il modello Whisper viene **caricato una sola volta** e riusato per tutti i file, poi viene liberato prima di caricare l'LLM (le due fasi non occupano la RAM insieme). Infine il cervello fa l'**ingest** di ogni sorgente: una pagina di sintesi, pagine concetto/entità collegate, aggiornamento di `index.md` e `log.md`.
+
+Il progresso è salvato sia per i video sia per l'ingest: un batch interrotto **riparte** da dove si era fermato. Altri due pulsanti lavorano su una Wiki esistente:
+
+- **🧠 Ingest Wiki esistente…** — sintetizza le sorgenti in `raw/` non ancora ingerite (utile dopo aver cambiato modello o aggiunto contenuti)
+- **💬 Chiedi alla Wiki…** — il cervello seleziona le pagine più pertinenti che stanno nel contesto, risponde citando le fonti con wikilink e **archivia la risposta** in `wiki/query_<data>_<domanda>.md`
 
 ### Struttura generata
 
@@ -357,9 +382,13 @@ _Wiki_<nome_cartella>/
 │   ├── 01_Riunione_Q2.md   #   → FONTI IMMUTABILI: l'agente le legge, non le modifica
 │   └── 02_Training_OBS.md
 │
-├── wiki/                   # Pagine generate dall'agente
-│   ├── index.md            #   → catalogo delle pagine
-│   └── log.md              #   → registro cronologico (append-only)
+├── wiki/                   # Pagine generate dal cervello LLM e/o dall'agente
+│   ├── index.md            #   → catalogo (Sorgenti, Entità, Concetti, Domande)
+│   ├── log.md              #   → registro cronologico (append-only)
+│   ├── sorgente_01_Riunione_Q2.md   # sintesi di una fonte
+│   ├── concetto_<nome>.md  #   → pagine concetto, con riferimenti alle fonti
+│   ├── entita_<nome>.md    #   → persone, progetti, strumenti, organizzazioni
+│   └── query_<data>_<domanda>.md    # risposte archiviate
 │
 ├── _segmenti/              # Cartelle di lavoro temporanee (ignorabili/eliminabili)
 │
@@ -380,6 +409,116 @@ _Wiki_<nome_cartella>/
 
 ---
 
+## 🤖 Sintesi con LLM locale
+
+### Modelli
+
+Il menu **Modello** propone un catalogo di modelli open source adatti a laptop e workstation:
+
+| Modello | Backend | Download | Contesto max | RAM consigliata |
+|---|---|---|---|---|
+| Qwen3 4B | Ollama / HF | ~2.6 GB | 32K | 8 GB |
+| **Qwen3 8B** (default) | Ollama / HF | ~5.2 GB | 32K | 16 GB |
+| Qwen3 14B | Ollama | ~9.3 GB | 32K | 32 GB |
+| Qwen2.5 7B Instruct | Ollama / HF | ~4.7 GB | 32K | 16 GB |
+| Llama 3.1 8B | Ollama / HF | ~4.9 GB | 128K | 16 GB |
+| Llama 3.2 3B | Ollama | ~2.0 GB | 128K | 8 GB |
+| Gemma 3 4B / 12B | Ollama / HF | ~3.3 / 8.1 GB | 128K | 8 / 24 GB |
+| Mistral Nemo 12B | Ollama | ~7.1 GB | 128K | 24 GB |
+| Phi-4 mini 3.8B | Ollama | ~2.5 GB | 128K | 8 GB |
+| gpt-oss 20B | Ollama | ~14 GB | 128K | 32 GB |
+| Mistral Small 3.2 24B | Ollama / HF | ~15 GB | 128K | 32 GB |
+| Gemma 3 27B | Ollama / HF | ~17 GB | 128K | 32 GB |
+| Qwen3 30B-A3B (MoE) | Ollama / HF | ~19 GB | 32K | 32 GB |
+| Qwen3 32B · Qwen2.5 32B · DeepSeek-R1 32B | Ollama (Qwen3 anche HF) | ~20 GB | 32K / 128K | 48 GB |
+| Llama 3.3 70B | Ollama | ~43 GB | 128K | 64 GB |
+| gpt-oss 120B | Ollama | ~65 GB | 128K | 96 GB+ |
+
+> 💡 **Qwen3 30B-A3B** è un *Mixture of Experts*: qualità vicina a un 30B ma attiva solo ~3B parametri per token, quindi genera a velocità simili a un modello piccolo (serve comunque la RAM per tutti i pesi). La riga informativa sotto il menu avvisa quando un modello rischia di non stare in RAM; su Apple Silicon segnala anche quando supera il limite GPU di macOS (~70% della memoria), oltre il quale una parte del modello gira su CPU.
+
+Con **✏️ Personalizzato…** puoi usare qualsiasi modello: un nome Ollama (es. `qwen3:30b-a3b`) oppure un GGUF HuggingFace nel formato `hf:<owner>/<repo>[:<pattern>]` (es. `hf:bartowski/Qwen_Qwen3-14B-GGUF:*Q4_K_M.gguf`). I modelli già installati in Ollama compaiono automaticamente nel menu (pulsante **↻** per aggiornare).
+
+### Parametri e finestra di contesto
+
+| Parametro | Default | Significato |
+|---|---|---|
+| **Contesto** | `Auto` | Token che il modello "vede" in un colpo (prompt + testo + risposta). In *Auto* l'app sceglie la finestra più piccola che contiene l'intera trascrizione (max 32K per contenere la RAM). Valori manuali vengono limitati al massimo del modello |
+| **Max output** | `4096` | Lunghezza massima della nota generata (token). Se viene raggiunto, il log lo segnala |
+| **Temperatura** | `0.3` | Bassa = più fedele al testo; alzala solo per output più "creativi" |
+| **Lingua nota** | Italiano | Italiano, English o la stessa lingua della registrazione |
+
+Come viene gestito il contesto:
+
+- Ollama di default usa un contesto piccolo e **tronca in silenzio** i testi lunghi: l'app imposta sempre `num_ctx` in modo esplicito e avvisa se l'input ha riempito la finestra.
+- Il testo viene misurato in token (esatto con llama.cpp, stima conservativa con Ollama).
+- Se la trascrizione non sta nel contesto scatta il **map-reduce**: la trascrizione viene divisa in blocchi sui confini di frase (con sovrapposizione), da ogni blocco si estraggono appunti dettagliati e gli appunti vengono fusi nella nota finale (fusione ricorsiva se ancora troppo lunghi).
+- Il contesto resta fisso per tutta la sessione, per non far ricaricare il modello a ogni chiamata.
+- Regola pratica per la RAM: la KV cache di un modello 4-8B occupa circa **0.14 MB per token** (≈ 4.5 GB a 32K), in aggiunta al peso del modello.
+
+> 📏 Una registrazione di 1 ora corrisponde a circa 9-10 mila parole ≈ 13-16 mila token: con *Auto* sta in un solo passaggio a 32K; registrazioni più lunghe passano automaticamente al map-reduce.
+
+### Thread, accelerazione e test di performance
+
+| Impostazione | Dove | Default | Effetto |
+|---|---|---|---|
+| **Thread CPU** (Whisper) | Impostazioni → Trascrizione | `Auto (4)` | Thread usati da faster-whisper/CTranslate2. Il default della libreria è **4 thread** indipendentemente dai core disponibili: alzarlo velocizza la trascrizione su CPU |
+| **Thread LLM** | Impostazioni → Sintesi | `Auto` | Thread CPU dell'LLM (`num_thread` di Ollama, `n_threads` di llama.cpp). In *Auto* Ollama usa i core ad alte prestazioni, llama.cpp metà dei core |
+| **Accelerazione** | Impostazioni → Sintesi | `Auto (GPU se disponibile)` | *Solo CPU* forza l'esecuzione su CPU (`num_gpu=0` / `n_gpu_layers=0`): utile per misurare l'effetto dei thread, perché su Apple Silicon e con GPU NVIDIA l'LLM gira di norma sulla GPU |
+
+Ogni elaborazione scrive nel log:
+
+- un'**intestazione di sistema** (OS, CPU, core, RAM, GPU, configurazione Whisper e LLM);
+- per Whisper, la **velocità di ogni segmento** (`66.8s audio in 10.5s → 6.3x tempo reale`) e nel report finale l'esecuzione (`CPU · int8 · 12 thread`) e i secondi per minuto di audio;
+- per l'LLM, per ogni chiamata i token e la velocità di **lettura del prompt** e di **generazione** (tok/s), la quota del modello **su GPU** e, a fine sessione, un riepilogo;
+- una riga in **`logs/performance.csv`** per ogni fase (`estrazione_audio`, `trascrizione`, `llm_nota`, `llm_ingest`, `llm_query`) con modello, thread, accelerazione, contesto, tempi, x tempo reale, tok/s e hardware: basta ripetere lo stesso contenuto cambiando un parametro e confrontare le righe.
+
+Esempio misurato su Apple M5 Pro (15 core, 24 GB), 2.2 minuti di parlato italiano:
+
+| Test | Configurazione | Risultato |
+|---|---|---|
+| Whisper `large-v3-turbo` | CPU int8, 4 thread (default) | 3.7x tempo reale (16.0 s per minuto di audio) |
+| Whisper `large-v3-turbo` | CPU int8, 12 thread | **6.2x** tempo reale (9.6 s per minuto di audio) |
+| LLM `qwen3:0.6b` | GPU Metal | generazione 183 tok/s |
+| LLM `qwen3:0.6b` | solo CPU, 4 thread | generazione 55 tok/s |
+| LLM `qwen3:0.6b` | solo CPU, 12 thread | generazione 97 tok/s |
+
+> 💡 Oltre il numero di core fisici di solito non si guadagna; sui chip ibridi (Apple Silicon, Intel 12ª gen+) i core efficienti sono più lenti, quindi conviene provare valori diversi e confrontare il CSV.
+
+### Tipi di nota
+
+| Tipo | Struttura della nota |
+|---|---|
+| Auto | Il modello riconosce il tipo di registrazione e sceglie le sezioni |
+| Standup / Daily | Aggiornamenti per persona (fatto / prossimo / blocchi), rischi, decisioni, action item |
+| Riunione / Call di lavoro | Contesto, partecipanti, punti discussi, decisioni, action item (Cosa/Chi/Entro), domande aperte |
+| Lezione / Studio | Concetti chiave, spiegazione, esempi ed esercizi, glossario, **domande di ripasso**, da approfondire |
+| Webinar / Talk | Tesi, argomenti, dati e citazioni, key takeaway, risorse citate |
+| Intervista | Profilo, temi, citazioni salienti, insight |
+| Brainstorming / Idee | Obiettivo, idee per tema, valutazione pro/contro, idee scelte, parcheggio |
+| Riassunto generico | Sintesi, punti principali, dettagli, conclusioni |
+
+Ogni nota ha un frontmatter YAML (`title`, `categoria`, `source`, `date`, `model`, `tags`) pronto per Obsidian.
+
+---
+
+## 🖥 Compatibilità macOS / Windows
+
+Lo stesso codice gira su entrambi i sistemi; le differenze sono gestite automaticamente:
+
+| Aspetto | macOS | Windows |
+|---|---|---|
+| Trascrizione Whisper | CPU (faster-whisper non supporta Metal); il menu Device non mostra `cuda` | CPU o **GPU NVIDIA CUDA** (`requirements-gpu.txt`), fallback automatico su CPU |
+| LLM | Ollama/llama.cpp usano la **GPU Metal** (memoria unificata) | Ollama usa GPU NVIDIA/AMD se presente, altrimenti CPU |
+| FFmpeg | `brew install ffmpeg` (cercato anche in `/opt/homebrew/bin` e `/usr/local/bin`, utile se l'app non parte da terminale) | `ffmpeg.exe` nella cartella dell'app oppure nel PATH |
+| Rilevamento hardware | `sysctl` (core Super/Performance o P/E, RAM) | Registro + API Win32 (nome CPU, core fisici, RAM), `nvidia-smi` per la GPU |
+| Finestra | dimensionata sullo schermo | tiene conto dello scaling DPI (125%/150%); su schermi bassi i blocchi superiori diventano scorrevoli |
+| Processi esterni | — | ffmpeg/nvidia-smi/Ollama avviati senza finestre di console |
+| Log e impostazioni | `logs/` accanto all'app, `~/.from_video_to_wiki/` | `logs\` accanto all'app (o all'eseguibile PyInstaller), `%USERPROFILE%\.from_video_to_wiki\` |
+
+> ℹ️ `torch` non è più necessario: il rilevamento CUDA usa `ctranslate2` (già installato con faster-whisper).
+
+---
+
 ## 📁 Struttura output
 
 Ogni video genera una cartella dedicata con il proprio nome:
@@ -388,10 +527,12 @@ Ogni video genera una cartella dedicata con il proprio nome:
 cartella_video/
 ├── intervista.mp4
 ├── intervista/
-│   └── intervista_trascrizione.txt
+│   ├── intervista_trascrizione.txt
+│   └── intervista_nota.md
 ├── riunione.mp4
 └── riunione/
-    └── riunione_trascrizione.txt
+    ├── riunione_trascrizione.txt
+    └── riunione_nota.md
 ```
 
 ---
@@ -486,7 +627,13 @@ Sulla GPU il fattore di velocità rispetto alla CPU supera le **~200x** grazie a
 | **macOS**: `FFmpeg non trovato` | `ffmpeg.exe` è per Windows. Installa `brew install ffmpeg` e riavvia il terminale. |
 | `open() got an unexpected keyword argument 'metadata_errors'` su ogni segmento | Incompatibilità tra `faster-whisper` e una versione recente di `av` (PyAV 19). Esegui `pip install "av<17"`. Fino alla correzione l'app può mostrare "Completato" con trascrizione vuota (0 segmenti trascritti). |
 | I segmenti `.wav` non vengono eliminati a fine trascrizione | La pulizia avviene solo se almeno un segmento è stato trascritto con successo e la trascrizione non è stata interrotta. Se nel report vedi "Segmenti trascritti: 0/N" c'è un errore a monte (controlla il file in `logs/`): i `.wav` restano apposta, così puoi ritrascrivere con **📂 Trascrivi da Cartella...** senza rifare lo splitting. |
-| Il batch non rigenera i `.md` in `raw/` | Assicurati che la spunta **Genera struttura LLM Wiki** sia attiva prima di avviare il batch |
+| Il batch non rigenera i `.md` in `raw/` | Assicurati che la spunta **Genera struttura Wiki** sia attiva prima di avviare il batch |
+| `Ollama non raggiungibile` | Installa Ollama da [ollama.com/download](https://ollama.com/download) e avvialo (l'app prova anche a lanciare `ollama serve`). Se usi un host diverso imposta la variabile `OLLAMA_HOST`. |
+| La nota è incompleta o il log segnala "Risposta troncata" | Aumenta **Max output** (es. 8192). |
+| Il log segnala "L'input ha riempito il contesto" | Aumenta **Contesto** o scegli un modello con contesto più ampio (Llama 3.1, Gemma 3, Mistral Nemo: 128K). |
+| La sintesi LLM è lenta o la RAM non basta | Usa un modello più piccolo (Qwen3 4B, Llama 3.2 3B, Phi-4 mini) e/o un contesto più piccolo: la RAM cresce con il contesto (≈ 0.14 MB/token di KV cache). |
+| Modelli `· HuggingFace` non disponibili | Esegui `pip install -r requirements-hf.txt`. Per repo "gated" serve `huggingface-cli login`. |
+| Note con nomi, numeri o riferimenti inventati | Abbassa la **Temperatura** (0.1-0.3) e usa un modello più grande: i modelli sotto i 3B tendono a copiare le istruzioni del template e ad allucinare. |
 
 ---
 

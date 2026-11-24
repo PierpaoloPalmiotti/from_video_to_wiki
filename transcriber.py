@@ -45,7 +45,7 @@ def trova_file_audio(cartella):
 
 def trascrivi_segmenti(cartella, modello_nome="large-v3-turbo", lingua=None,
                        device="auto", formato="txt", output_file=None,
-                       beam_size=5, no_vad=False, callback=None):
+                       beam_size=5, no_vad=False, callback=None, cpu_threads=0):
     """
     Trascrive tutti i file audio in una cartella e salva un file unificato.
 
@@ -59,6 +59,7 @@ def trascrivi_segmenti(cartella, modello_nome="large-v3-turbo", lingua=None,
         beam_size:     beam search size (5 = qualita', 1 = veloce)
         no_vad:        True per disabilitare il filtro VAD
         callback:      funzione callback(messaggio) per log
+        cpu_threads:   thread CPU per CTranslate2 (0 = default della libreria, 4)
 
     Returns:
         Percorso del file di trascrizione generato, o "" se nessun file trovato.
@@ -76,21 +77,26 @@ def trascrivi_segmenti(cartella, modello_nome="large-v3-turbo", lingua=None,
 
     # Auto-detect device
     if device == "auto":
-        try:
-            import torch
-            dev = "cuda" if torch.cuda.is_available() else "cpu"
-        except ImportError:
-            dev = "cpu"
+        if sys.platform == "darwin":
+            dev = "cpu"          # faster-whisper non supporta GPU su macOS
+        else:
+            try:
+                import torch
+                dev = "cuda" if torch.cuda.is_available() else "cpu"
+            except ImportError:
+                dev = "cpu"
     else:
         dev = device
 
     compute = "float16" if dev == "cuda" else "int8"
 
+    thread_info = "GPU" if dev == "cuda" else f"{cpu_threads or 4} thread CPU"
     if callback:
-        callback(f"Caricamento modello '{modello_nome}' su {dev} ({compute})...")
+        callback(f"Caricamento modello '{modello_nome}' su {dev} ({compute}, {thread_info})...")
 
     t0 = time.time()
-    model = WhisperModel(modello_nome, device=dev, compute_type=compute)
+    model = WhisperModel(modello_nome, device=dev, compute_type=compute,
+                         cpu_threads=int(cpu_threads or 0))
     dt = time.time() - t0
 
     if callback:
@@ -265,6 +271,8 @@ Esempi:
                         help="Percorso file output (default: trascrizione.txt)")
     parser.add_argument("--no-vad", action="store_true",
                         help="Disabilita filtro VAD (non consigliato)")
+    parser.add_argument("--cpu-threads", type=int, default=0,
+                        help="Thread CPU (default: 0 = 4 thread di faster-whisper)")
 
     args = parser.parse_args()
 
@@ -278,6 +286,7 @@ Esempi:
         output_file=args.output,
         no_vad=args.no_vad,
         callback=print,
+        cpu_threads=args.cpu_threads,
     )
 
 

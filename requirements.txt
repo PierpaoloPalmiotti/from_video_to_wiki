@@ -14,8 +14,10 @@ moviepy>=1.0.3
 # Trascrizione (motore CTranslate2)
 faster-whisper>=1.0.0
 
-# Per il rilevamento automatico CUDA (auto-detect device)
-# Su sistemi senza GPU questo pacchetto resta utile per il check `torch.cuda.is_available()`
-# che ritorna False senza errori. Se vuoi un'installazione minimale CPU-only senza torch,
-# puoi commentare questa riga: l'app userà comunque CPU come default.
-torch>=2.0.0
+# torch NON è più necessario: il rilevamento CUDA ("device = auto") usa
+# ctranslate2 (già incluso con faster-whisper). Se torch è installato viene
+# usato anche per svuotare la cache CUDA a fine trascrizione (solo GPU NVIDIA).
+# torch>=2.0.0
+
+# Nessuna dipendenza extra per l'LLM via Ollama (https://ollama.com/download).
+# Per i modelli HuggingFace GGUF: pip install -r requirements-hf.txt

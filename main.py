@@ -1,4 +1,5 @@
 import customtkinter as ctk
+import tkinter as tk
 from tkinter import messagebox, filedialog
 import os
 import sys
@@ -8,6 +9,7 @@ import math
 import time
 import json
 import warnings
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -15,6 +17,9 @@ from datetime import datetime
 
 # Sopprimi i warnings
 warnings.filterwarnings("ignore")
+
+import llm_engine as llm
+import perf
 
 
 # ---------------------------------------------------------------------------
@@ -26,9 +31,24 @@ ctk.set_default_color_theme("blue")
 # ---------------------------------------------------------------------------
 # Registra i percorsi DLL NVIDIA installati via pip (cublas, cudnn, ecc.)
 # ---------------------------------------------------------------------------
+_DLL_HANDLES = []   # riferimenti alle cartelle DLL aggiunte (Windows)
+
+
 def _registra_nvidia_dll():
     """Aggiunge al PATH di sistema le cartelle lib/bin dei pacchetti nvidia-*
-    installati via pip, così CTranslate2 può trovare cublas64_12.dll ecc."""
+    installati via pip, così CTranslate2 può trovare cublas64_12.dll ecc.
+    Serve solo su Windows (su macOS non c'è CUDA, su Linux vale LD_LIBRARY_PATH)."""
+    if os.name != "nt":
+        return
+
+    def _aggiungi(cartella):
+        if cartella not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = cartella + os.pathsep + os.environ.get("PATH", "")
+        try:  # Python 3.8+: il PATH non basta per le DLL dipendenti
+            _DLL_HANDLES.append(os.add_dll_directory(cartella))
+        except Exception:
+            pass
+
     try:
         import importlib.metadata
         nvidia_packages = [
@@ -44,15 +64,12 @@ def _registra_nvidia_dll():
                 # Risali alla radice del pacchetto
                 for subdir in ("lib", "bin"):
                     candidate = os.path.join(pkg_dir, subdir)
-                    if os.path.isdir(candidate) and candidate not in os.environ.get("PATH", ""):
-                        os.environ["PATH"] = candidate + os.pathsep + os.environ.get("PATH", "")
+                    if os.path.isdir(candidate):
+                        _aggiungi(candidate)
                 # Prova anche le sottocartelle che contengono DLL
                 for root, dirs, fnames in os.walk(pkg_dir):
-                    for fname in fnames:
-                        if fname.lower().endswith(".dll"):
-                            if root not in os.environ.get("PATH", ""):
-                                os.environ["PATH"] = root + os.pathsep + os.environ.get("PATH", "")
-                            break
+                    if any(f.lower().endswith(".dll") for f in fnames):
+                        _aggiungi(root)
             except Exception:
                 continue
     except Exception:
@@ -133,24 +150,37 @@ def get_resource_path(relative_path):
     try:
         base_path = sys._MEIPASS
     except Exception:
-        base_path = os.path.abspath(".")
+        base_path = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_path, relative_path)
 
 
+_FFMPEG_CACHE = None
+
+
 def find_ffmpeg():
+    """Cerca ffmpeg (Windows: ffmpeg.exe nella cartella dell'app o nel PATH;
+    macOS/Linux: PATH, Homebrew, /usr/bin). Il risultato viene messo in cache."""
+    global _FFMPEG_CACHE
+    if _FFMPEG_CACHE:
+        return _FFMPEG_CACHE
+    exe = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
     possible_paths = [
-        'ffmpeg.exe', 'ffmpeg',
-        get_resource_path('ffmpeg.exe'),
-        os.path.join(os.path.dirname(sys.executable), 'ffmpeg.exe'),
-        os.path.join(os.path.dirname(sys.executable), 'ffmpeg'),
+        get_resource_path(exe),
+        os.path.join(os.path.dirname(sys.executable), exe),
+        shutil.which("ffmpeg"),
     ]
+    if os.name != "nt":
+        possible_paths += ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
     for path in possible_paths:
+        if not path or not os.path.isfile(path):
+            continue
         try:
-            result = subprocess.run([path, '-version'],
-                                    capture_output=True, timeout=5)
+            result = subprocess.run([path, '-version'], capture_output=True,
+                                    timeout=5, **perf.SUBPROCESS_KW)
             if result.returncode == 0:
+                _FFMPEG_CACHE = path
                 return path
-        except:
+        except Exception:
             continue
     return None
 
@@ -184,7 +214,8 @@ def split_audio_with_ffmpeg(input_path, output_dir, target_size_mb, base_name,
 
     info_cmd = [ffmpeg_path, '-i', input_path, '-hide_banner']
     try:
-        result = subprocess.run(info_cmd, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(info_cmd, capture_output=True, text=True, timeout=30,
+                                **perf.SUBPROCESS_KW)
         output = result.stderr
         duration_line = None
         for line in output.split('\n'):
@@ -225,7 +256,8 @@ def split_audio_with_ffmpeg(input_path, output_dir, target_size_mb, base_name,
             '-acodec', 'pcm_s16le', '-y', segment_path
         ]
         try:
-            result = subprocess.run(cmd, capture_output=True, timeout=300)
+            result = subprocess.run(cmd, capture_output=True, timeout=300,
+                                    **perf.SUBPROCESS_KW)
             if result.returncode != 0:
                 if callback:
                     callback(f"  ✗ Errore FFmpeg segmento {i+1}")
@@ -241,7 +273,7 @@ def split_audio_with_ffmpeg(input_path, output_dir, target_size_mb, base_name,
             if callback:
                 callback(f"  ✗ Errore segmento {i+1}: {e}")
 
-    return segments_created, segment_duration / 60
+    return segments_created, segment_duration / 60, total_seconds
 
 
 def estrai_e_splitta_video(video_path, output_dir, target_size_mb,
@@ -295,7 +327,7 @@ def estrai_e_splitta_video(video_path, output_dir, target_size_mb,
     if callback:
         callback("⏳ Segmentazione audio...\n")
 
-    segments, seg_dur_min = split_audio_with_ffmpeg(
+    segments, seg_dur_min, durata_audio_s = split_audio_with_ffmpeg(
         temp_audio_path, output_dir, target_size_mb, base_name,
         callback=callback, stop_event=stop_event)
 
@@ -306,7 +338,20 @@ def estrai_e_splitta_video(video_path, output_dir, target_size_mb,
     except:
         pass
 
-    return segments, seg_dur_min, time.time() - t0
+    dt = time.time() - t0
+    video_mb = get_file_size_mb(video_path)
+    if callback and dt > 0:
+        callback(f"   ⏱  Estrazione + segmentazione: {formatta_tempo(dt)} · "
+                 f"{video_mb / dt:.1f} MB/s · audio {durata_audio_s / 60:.1f} min "
+                 f"({durata_audio_s / dt:.0f}x tempo reale)")
+    perf.registra_performance(dict(
+        fase="estrazione_audio", sorgente=os.path.basename(video_path),
+        backend="ffmpeg/moviepy", device="cpu", audio_min=durata_audio_s / 60,
+        input_mb=video_mb, tempo_s=dt,
+        x_realtime=(durata_audio_s / dt) if dt > 0 else None,
+        note="interrotto" if (stop_event and stop_event.is_set()) else ""))
+
+    return segments, seg_dur_min, dt
 
 
 def trova_file_audio(cartella):
@@ -414,23 +459,65 @@ def _salva_batch_progresso(cartella_progetto, dati):
 # Trascrizione con checkpoint + stop/pausa + file parziale
 # ---------------------------------------------------------------------------
 
+def _risolvi_device(device):
+    """'auto' → cuda se disponibile (solo NVIDIA), altrimenti cpu.
+    Su macOS faster-whisper non supporta GPU (Metal): resta CPU."""
+    if device != "auto":
+        return device
+    if sys.platform == "darwin":
+        return "cpu"
+    try:
+        import torch
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except ImportError:
+        try:
+            import ctranslate2
+            return "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
+        except Exception:
+            return "cpu"
+
+
+def _descrivi_esecuzione_whisper(dev, compute, cpu_threads):
+    if dev == "cuda":
+        return f"GPU CUDA · {compute}"
+    return f"CPU · {compute} · {perf.thread_whisper_effettivi(cpu_threads)} thread"
+
+
+def _carica_whisper(modello_nome, dev, compute, cpu_threads, callback=None):
+    """Carica WhisperModel con i thread richiesti; fallback CUDA → CPU."""
+    t0 = time.time()
+    if callback:
+        callback(f"⏳ Caricamento modello '{modello_nome}' "
+                 f"({_descrivi_esecuzione_whisper(dev, compute, cpu_threads)})...")
+    try:
+        model = WhisperModel(modello_nome, device=dev, compute_type=compute,
+                             cpu_threads=int(cpu_threads or 0))
+    except Exception as e:
+        if dev != "cuda":
+            raise
+        if callback:
+            callback(f"⚠ CUDA non disponibile ({e})")
+            callback("⏳ Fallback automatico su CPU (int8)...")
+        dev, compute = "cpu", "int8"
+        model = WhisperModel(modello_nome, device=dev, compute_type=compute,
+                             cpu_threads=int(cpu_threads or 0))
+    if callback:
+        callback(f"✓ Modello caricato in {time.time() - t0:.1f}s "
+                 f"({_descrivi_esecuzione_whisper(dev, compute, cpu_threads)})\n")
+    return model, dev, compute
+
+
 def trascrivi_segmenti(cartella, modello_nome="large-v3-turbo", lingua=None,
                        device="auto", formato="txt", callback=None,
                        stop_event=None, pause_event=None,
                        video_size_mb=0, tempo_splitting=0,
-                       model_precaricato=None):
+                       model_precaricato=None, cpu_threads=0):
+    """Trascrive i file audio di `cartella` con checkpoint, stop/pausa e file
+    parziale. `cpu_threads`: thread CPU per CTranslate2 (0 = default, 4)."""
     if not WHISPER_DISPONIBILE:
         raise ImportError("faster-whisper non installato.\nInstalla con: pip install faster-whisper")
 
-    if device == "auto":
-        try:
-            import torch
-            dev = "cuda" if torch.cuda.is_available() else "cpu"
-        except ImportError:
-            dev = "cpu"
-    else:
-        dev = device
-
+    dev = _risolvi_device(device)
     compute = "float16" if dev == "cuda" else "int8"
 
     # Se ci viene passato un modello già caricato (batch), lo riusiamo e NON
@@ -438,26 +525,11 @@ def trascrivi_segmenti(cartella, modello_nome="large-v3-turbo", lingua=None,
     model = model_precaricato
     model_di_proprieta = model is None
 
-    t0 = time.time()
     try:
         if model is None:
-            if callback:
-                callback(f"⏳ Caricamento modello '{modello_nome}' su {dev} ({compute})...")
-            try:
-                model = WhisperModel(modello_nome, device=dev, compute_type=compute)
-            except Exception as e:
-                if dev == "cuda":
-                    if callback:
-                        callback(f"⚠ CUDA non disponibile ({e})")
-                        callback(f"⏳ Fallback automatico su CPU (int8)...")
-                    dev = "cpu"
-                    compute = "int8"
-                    model = WhisperModel(modello_nome, device=dev, compute_type=compute)
-                else:
-                    raise
-            dt = time.time() - t0
-            if callback:
-                callback(f"✓ Modello caricato in {dt:.1f}s (device={dev})\n")
+            model, dev, compute = _carica_whisper(modello_nome, dev, compute,
+                                                  cpu_threads, callback)
+        esecuzione = _descrivi_esecuzione_whisper(dev, compute, cpu_threads)
 
         file_audio = trova_file_audio(cartella)
         if not file_audio:
@@ -485,15 +557,17 @@ def trascrivi_segmenti(cartella, modello_nome="large-v3-turbo", lingua=None,
             percorso_output = _finalizza_trascrizione(
                 cartella, risultati, risultati_dettaglio,
                 durata_totale, file_audio, formato, 0, callback,
-                video_size_mb=video_size_mb, tempo_splitting=tempo_splitting)
+                video_size_mb=video_size_mb, tempo_splitting=tempo_splitting,
+                esecuzione=esecuzione)
             return percorso_output, 0.0
 
         if callback:
             callback(f"📂 Trovati {len(file_audio)} file audio totali, "
-                     f"{len(file_da_fare)} da trascrivere\n")
+                     f"{len(file_da_fare)} da trascrivere · esecuzione: {esecuzione}\n")
 
         t_inizio = time.time()
         interrotto = False
+        durata_sessione = 0.0      # audio trascritto in QUESTA esecuzione (per le metriche)
 
         for i, nome_file in enumerate(file_da_fare, 1):
             # --- Check STOP ---
@@ -508,11 +582,13 @@ def trascrivi_segmenti(cartella, modello_nome="large-v3-turbo", lingua=None,
             if pause_event and pause_event.is_set():
                 if callback:
                     callback(f"⏸  In pausa... (clicca ▶ Riprendi per continuare)")
+                t_pausa = time.time()
                 while pause_event.is_set():
                     if stop_event and stop_event.is_set():
                         interrotto = True
                         break
                     time.sleep(0.3)
+                t_inizio += time.time() - t_pausa     # la pausa non conta nelle metriche
                 if interrotto:
                     if callback:
                         callback(f"\n⏹  Trascrizione interrotta durante la pausa")
@@ -526,6 +602,7 @@ def trascrivi_segmenti(cartella, modello_nome="large-v3-turbo", lingua=None,
                 callback(f"[{indice_globale}/{len(file_audio)}] {nome_file}...")
 
             try:
+                t_seg = time.time()
                 segmenti_gen, info = model.transcribe(
                     percorso, language=lingua, beam_size=5,
                     vad_filter=True,
@@ -534,14 +611,16 @@ def trascrivi_segmenti(cartella, modello_nome="large-v3-turbo", lingua=None,
                 )
                 segmenti_lista = []
                 testi = []
-                for seg in segmenti_gen:
+                for seg in segmenti_gen:   # la trascrizione avviene durante l'iterazione
                     t = seg.text.strip()
                     if t:
                         segmenti_lista.append({"inizio": seg.start, "fine": seg.end, "testo": t})
                         testi.append(t)
+                dt_seg = time.time() - t_seg
 
                 testo_unito = " ".join(testi)
                 durata_totale += info.duration
+                durata_sessione += info.duration
                 risultati.append(testo_unito)
                 risultati_dettaglio.append({
                     "file": nome_file, "lingua": info.language,
@@ -560,13 +639,25 @@ def trascrivi_segmenti(cartella, modello_nome="large-v3-turbo", lingua=None,
 
                 stato = "✓" if testo_unito else "— silenzio"
                 if callback:
-                    callback(f"  {stato} | {info.language} | {info.duration:.1f}s")
+                    vel = f"{info.duration / dt_seg:.1f}x" if dt_seg > 0 else "-"
+                    callback(f"  {stato} | {info.language} | {info.duration:.1f}s audio "
+                             f"in {dt_seg:.1f}s → {vel} tempo reale")
             except Exception as e:
                 risultati.append("")
                 if callback:
                     callback(f"  ✗ ERRORE: {e}")
 
         tempo_trascrizione = time.time() - t_inizio
+
+        if durata_sessione > 0 and tempo_trascrizione > 0:
+            perf.registra_performance(dict(
+                fase="trascrizione", sorgente=os.path.basename(os.path.normpath(cartella)),
+                modello=modello_nome, backend="faster-whisper", device=dev, compute=compute,
+                thread=perf.thread_whisper_effettivi(cpu_threads, dev) or "",
+                gpu_offload="cuda" if dev == "cuda" else "no",
+                audio_min=durata_sessione / 60, input_mb=video_size_mb or None,
+                tempo_s=tempo_trascrizione, x_realtime=durata_sessione / tempo_trascrizione,
+                chiamate=len(file_da_fare), note="interrotto" if interrotto else ""))
 
         if interrotto:
             # Genera file di trascrizione parziale
@@ -582,7 +673,7 @@ def trascrivi_segmenti(cartella, modello_nome="large-v3-turbo", lingua=None,
                 callback(f"   Segmenti completati:  {n_completati}/{len(file_audio)}")
                 callback(f"   Rimanenti:            {len(file_audio) - n_completati}")
                 callback(f"   File parziale:        {percorso_parziale}")
-                callback(f"   Riprendi con 'Trascrivi Segmenti' o 'Trascrivi da Cartella'")
+                callback(f"   Riprendi con 'Trascrivi segmenti' o 'Da cartella audio…'")
                 callback(f"   (alla ripresa il file verra' aggiornato con i nuovi segmenti)")
             return "", tempo_trascrizione
 
@@ -590,7 +681,8 @@ def trascrivi_segmenti(cartella, modello_nome="large-v3-turbo", lingua=None,
         percorso_output = _finalizza_trascrizione(
             cartella, risultati, risultati_dettaglio,
             durata_totale, file_audio, formato, tempo_trascrizione, callback,
-            video_size_mb=video_size_mb, tempo_splitting=tempo_splitting)
+            video_size_mb=video_size_mb, tempo_splitting=tempo_splitting,
+            esecuzione=esecuzione, durata_sessione=durata_sessione)
 
         return percorso_output, tempo_trascrizione
 
@@ -605,7 +697,8 @@ def trascrivi_segmenti(cartella, modello_nome="large-v3-turbo", lingua=None,
 def _finalizza_trascrizione(cartella, risultati, risultati_dettaglio,
                             durata_totale, file_audio, formato,
                             tempo_trascrizione, callback,
-                            video_size_mb=0, tempo_splitting=0):
+                            video_size_mb=0, tempo_splitting=0,
+                            esecuzione="", durata_sessione=None):
     """Scrive il file finale, pulisce audio e rimuove il checkpoint."""
 
     percorso_output = _scrivi_file_trascrizione(
@@ -613,19 +706,25 @@ def _finalizza_trascrizione(cartella, risultati, risultati_dettaglio,
         durata_totale, formato, tempo_trascrizione)
 
     n_ok = sum(1 for r in risultati if r)
+    audio_misurato = durata_sessione if durata_sessione is not None else durata_totale
     if callback:
         callback(f"\n{'─'*50}")
         callback(f"📊 REPORT TRASCRIZIONE")
         callback(f"{'─'*50}")
         callback(f"   Segmenti trascritti:  {n_ok}/{len(file_audio)}")
         callback(f"   Audio totale:         {durata_totale/60:.1f} min")
+        if esecuzione:
+            callback(f"   Esecuzione:           {esecuzione}")
         callback(f"   Tempo trascrizione:   {formatta_tempo(tempo_trascrizione)}")
-        if tempo_trascrizione > 0:
-            callback(f"   Velocita':            {durata_totale/tempo_trascrizione:.1f}x tempo reale")
+        if tempo_trascrizione > 0 and audio_misurato > 0:
+            callback(f"   Velocita':            {audio_misurato/tempo_trascrizione:.1f}x tempo reale"
+                     f"  ({tempo_trascrizione / (audio_misurato / 60):.1f} s per minuto di audio)")
         if video_size_mb > 0 and (tempo_splitting + tempo_trascrizione) > 0:
             sec_per_mb = (tempo_splitting + tempo_trascrizione) / video_size_mb
             callback(f"   Performance E2E:      {sec_per_mb:.2f} sec/MB")
         callback(f"   Salvato in:           {percorso_output}")
+        if tempo_trascrizione > 0:
+            callback(f"   📈 Metriche aggiunte a: {perf.PERF_CSV}")
 
     # Pulizia segmenti audio (solo se completato al 100%)
     if n_ok > 0:
@@ -694,10 +793,11 @@ def formatta_tempo(secondi):
 
 def _slug(nome):
     s = re.sub(r'[^\w\-]+', '_', nome, flags=re.UNICODE).strip('_')
-    return s or "sorgente"
+    # Limite di lunghezza: su Windows i percorsi oltre 260 caratteri falliscono
+    return s[:80].rstrip('_') or "sorgente"
 
 
-def _scrivi_sorgente_wiki(raw_dir, indice, video_name, testo, n_segmenti):
+def _scrivi_sorgente_wiki(raw_dir, indice, video_name, testo, n_segmenti=None):
     """Scrive una trascrizione come sorgente markdown immutabile in raw/.
     Ritorna il percorso del file creato."""
     base = os.path.splitext(video_name)[0]
@@ -716,7 +816,7 @@ def _scrivi_sorgente_wiki(raw_dir, indice, video_name, testo, n_segmenti):
         "type: transcript\n"
         f"date: {oggi}\n"
         f"index: {indice:02d}\n"
-        f"segments: {n_segmenti}\n"
+        + (f"segments: {n_segmenti}\n" if n_segmenti is not None else "") +
         "tags: [trascrizione, sorgente]\n"
         "---\n\n"
     )
@@ -748,7 +848,10 @@ persistente che si arricchisce con ogni nuova sorgente e con ogni domanda.
 - Tutto in markdown, in italiano.
 - Collegamenti con i wikilink di Obsidian: `[[Nome Pagina]]`.
 - Nomi file: `entita_<nome>.md`, `concetto_<nome>.md`, `sintesi_<tema>.md`,
-  `sorgente_<slug>.md`.
+  `sorgente_<slug>.md`, `query_<data>_<slug>.md` (risposte archiviate).
+- Le pagine con `generato_da: <modello>` nel frontmatter sono una **prima bozza**
+  prodotta da un LLM locale dall'app "From Video to Wiki": verificale sulle
+  fonti `raw/`, arricchiscile e correggile liberamente.
 - Ogni pagina inizia con frontmatter YAML (vedi sotto).
 - Quando un dato nuovo contraddice uno vecchio, segnalalo con un blocco
   `> [!warning]` e cita entrambe le fonti.
@@ -831,11 +934,13 @@ costruita a partire dalle trascrizioni dei tuoi video, mantenuta da un agente LL
 """
 
 
-def genera_struttura_wiki(cartella_progetto, cartella_video_origine, callback=None):
+def genera_struttura_wiki(cartella_progetto, cartella_video_origine, callback=None,
+                          voce_log=True):
     """Crea/aggiorna lo scaffold della LLM Wiki nel progetto.
 
     Non sovrascrive CLAUDE.md, README, index.md se già presenti (la wiki è
-    di proprietà dell'agente): aggiunge solo ciò che manca e logga il batch.
+    di proprietà dell'agente): aggiunge solo ciò che manca e, se `voce_log`,
+    logga il batch.
     """
     raw_dir = os.path.join(cartella_progetto, "raw")
     wiki_dir = os.path.join(cartella_progetto, "wiki")
@@ -887,11 +992,12 @@ def genera_struttura_wiki(cartella_progetto, cartella_video_origine, callback=No
     if not os.path.exists(log_path):
         with open(log_path, "w", encoding="utf-8") as f:
             f.write("# Log della Wiki\n\nRegistro cronologico append-only.\n\n")
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write(f"## [{oggi}] batch | preparate {len(sorgenti_md)} sorgenti "
-                f"da '{os.path.basename(os.path.normpath(cartella_video_origine))}'\n")
-        f.write("- Sorgenti aggiornate in `raw/` e pronte per l'ingest.\n")
-        f.write("- Prossimo passo: l'agente fa l'ingest una fonte alla volta.\n\n")
+    if voce_log:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"## [{oggi}] batch | preparate {len(sorgenti_md)} sorgenti "
+                    f"da '{os.path.basename(os.path.normpath(cartella_video_origine))}'\n")
+            f.write("- Sorgenti aggiornate in `raw/` e pronte per l'ingest.\n")
+            f.write("- Prossimo passo: l'agente fa l'ingest una fonte alla volta.\n\n")
 
     if callback:
         callback(f"📚 Struttura Wiki pronta/aggiornata in: {cartella_progetto}")
@@ -903,7 +1009,8 @@ def genera_struttura_wiki(cartella_progetto, cartella_video_origine, callback=No
 
 def elabora_cartella_video(cartella_video, target_size_mb, modello, lingua,
                            device, formato, genera_wiki=True,
-                           callback=None, stop_event=None, pause_event=None):
+                           callback=None, stop_event=None, pause_event=None,
+                           cpu_threads=0):
     """Processa TUTTI i video di una cartella (estrai → splitta → trascrivi)
     e prepara la struttura LLM Wiki con tutte le trascrizioni come sorgenti.
 
@@ -937,33 +1044,11 @@ def elabora_cartella_video(cartella_video, target_size_mb, modello, lingua,
         callback(f"📦 Progetto Wiki: {cartella_progetto}\n")
 
     # --- Risoluzione device + caricamento UNICO del modello ---
-    if device == "auto":
-        try:
-            import torch
-            dev = "cuda" if torch.cuda.is_available() else "cpu"
-        except ImportError:
-            dev = "cpu"
-    else:
-        dev = device
+    dev = _risolvi_device(device)
     compute = "float16" if dev == "cuda" else "int8"
-
     if callback:
-        callback(f"⏳ Caricamento modello '{modello}' su {dev} ({compute}) (una sola volta)...")
-    t_model = time.time()
-    model = None
-    try:
-        model = WhisperModel(modello, device=dev, compute_type=compute)
-    except Exception as e:
-        if dev == "cuda":
-            if callback:
-                callback(f"⚠ CUDA non disponibile ({e}) — fallback su CPU (int8)")
-            dev = "cpu"
-            compute = "int8"
-            model = WhisperModel(modello, device=dev, compute_type=compute)
-        else:
-            raise
-    if callback:
-        callback(f"✓ Modello caricato in {time.time()-t_model:.1f}s (device={dev})\n")
+        callback("(il modello Whisper viene caricato una sola volta per tutto il batch)")
+    model, dev, compute = _carica_whisper(modello, dev, compute, cpu_threads, callback)
 
     t_batch0 = time.time()
     n_nuovi = 0
@@ -1015,7 +1100,7 @@ def elabora_cartella_video(cartella_video, target_size_mb, modello, lingua,
                 device=dev, formato=formato, callback=callback,
                 stop_event=stop_event, pause_event=pause_event,
                 video_size_mb=video_mb, tempo_splitting=t_split,
-                model_precaricato=model)
+                model_precaricato=model, cpu_threads=cpu_threads)
 
             if not percorso_txt:
                 # Interrotto durante la trascrizione (progresso già salvato),
@@ -1071,258 +1156,586 @@ def elabora_cartella_video(cartella_video, target_size_mb, modello, lingua,
 # ===========================================================================
 # GUI — CustomTkinter
 # ===========================================================================
+SETTINGS_PATH = os.path.join(llm.APP_DIR, "settings.json")
+
+CTX_SCELTE = {"Auto": "auto", "4K": 4096, "8K": 8192, "16K": 16384,
+              "32K": 32768, "64K": 65536, "128K": 131072}
+MAX_OUTPUT_SCELTE = ["1024", "2048", "4096", "8192"]
+LINGUE_WHISPER = ["Auto-detect", "it (Italiano)", "en (English)", "es (Español)",
+                  "fr (Français)", "de (Deutsch)", "pt (Português)"]
+BRAIN_UGUALE = "(come Impostazioni)"
+COLORE_TEAL = "#16808a"
+
+# Differenze tra piattaforme
+SU_MAC = sys.platform == "darwin"
+SU_WINDOWS = os.name == "nt"
+FONT_LOG = "Menlo" if SU_MAC else ("Consolas" if SU_WINDOWS else "DejaVu Sans Mono")
+# faster-whisper non ha backend GPU su macOS (niente Metal): solo CPU
+DEVICE_SCELTE = ["auto", "cpu"] if SU_MAC else ["auto", "cpu", "cuda"]
+N_CPU = os.cpu_count() or 4
+THREAD_WHISPER_AUTO = f"Auto ({perf.WHISPER_THREAD_DEFAULT})"
+THREAD_WHISPER_SCELTE = [THREAD_WHISPER_AUTO] + [str(i) for i in range(1, N_CPU + 1)]
+THREAD_LLM_SCELTE = ["Auto"] + [str(i) for i in range(1, N_CPU + 1)]
+ACCEL_SCELTE = {"Auto (GPU se disponibile)": "auto", "Solo CPU": "cpu"}
+COLORE_SOTTOFRAME = ("gray86", "gray20")
+
+
+INFO_PARAMETRI = {
+    # Trascrizione
+    "Modello:": "Modello Whisper per la trascrizione. Più grande = più preciso ma più lento. "
+                "large-v3-turbo è il miglior compromesso per italiano e inglese.",
+    "Lingua:": "Lingua parlata nella registrazione. Auto-detect la riconosce da sola; "
+               "forzarla evita errori su audio misti o rumorosi.",
+    "Formato:": "txt = solo testo. dettagliato = testo con i timestamp di ogni frase.",
+    "Device:": "Dove gira Whisper. auto = GPU NVIDIA se presente, altrimenti CPU. "
+               "Su Mac Whisper usa sempre la CPU.",
+    "MB/segmento:": "L'audio viene diviso in pezzi di questa dimensione. Pezzi piccoli = "
+                    "checkpoint più frequenti (ripresa dopo uno stop), nessun impatto sulla qualità.",
+    "Thread CPU:": "Core della CPU usati da Whisper. Il default della libreria è 4: alzarlo "
+                   "accelera la trascrizione (es. 12 thread ≈ 1.7x più veloce su M5 Pro). "
+                   f"Questa macchina ha {os.cpu_count() or '?'} core logici.",
+    # LLM
+    "Modello LLM:": "Il modello che scrive la nota. Più parametri (8B, 14B, 32B…) = note migliori "
+                    "ma più RAM e più lentezza. Ollama lo scarica al primo uso.",
+    "Tipo contenuto:": "Sceglie la struttura della nota: standup, riunione, lezione da studiare, "
+                       "talk, intervista… Auto = il modello riconosce da solo il tipo.",
+    "Lingua nota:": "Lingua in cui viene scritta la nota, indipendentemente da quella della registrazione.",
+    "Contesto:": "Quanto testo il modello legge in una volta (istruzioni + trascrizione + risposta), "
+                 "in token (~¾ di parola). Auto lo adatta al testo; se non basta, la trascrizione "
+                 "viene divisa in blocchi. Più contesto = più RAM.",
+    "Max output:": "Lunghezza massima della nota in token (4096 ≈ 3000 parole). "
+                   "Se il log segnala 'risposta troncata', alzalo.",
+    "Temperatura:": "Creatività del modello (0–2). Bassa (0.1–0.3) = fedele alla trascrizione; "
+                    "alta = più libera ma con rischio di inventare.",
+    "Thread LLM:": "Core CPU usati dall'LLM. Conta solo quando il modello gira su CPU. "
+                   "Auto = sceglie Ollama.",
+    "Accelerazione:": "GPU se disponibile = più veloce (Metal su Mac, NVIDIA su Windows). "
+                      "Solo CPU = per test di performance sui thread o se il modello non sta in GPU.",
+    # Singolo contenuto / Wiki
+    "Video:": "Il file video (o audio dentro un video) da elaborare.",
+    "Knowledge base:": "Facoltativa. Cartella Wiki in cui archiviare ogni nota: sorgente in raw/, "
+                       "sintesi, pagine concetto collegate, index e log. Cresce a ogni contenuto.",
+    "Cartella video:": "Cartella con più video da elaborare in sequenza (batch). "
+                       "Il risultato va in '_Wiki_<nome>' dentro la cartella.",
+    "Cervello Wiki:": "Il modello LLM che legge le trascrizioni e costruisce la Wiki "
+                      "(sintesi, concetti, risposte). Può essere diverso da quello delle note.",
+    "nota": "Dopo la trascrizione, l'LLM scrive una nota .md strutturata accanto alla "
+            "trascrizione (e nella knowledge base, se impostata).",
+    "struttura": "Crea la struttura Wiki per Obsidian: raw/ (trascrizioni), wiki/ (pagine), "
+                 "CLAUDE.md/AGENTS.md (istruzioni per un agente).",
+    "ingest": "Dopo il batch, il cervello sintetizza ogni trascrizione, crea pagine concetto/entità "
+              "collegate e aggiorna index e log.",
+    "scarica": "Scarica subito il modello selezionato (altrimenti viene scaricato al primo uso).",
+    "refresh": "Ricarica l'elenco dei modelli già installati in Ollama.",
+}
+
+
+class Tooltip:
+    """Fumetto esplicativo: compare al passaggio del mouse (o al clic) sul widget."""
+
+    def __init__(self, widget, testo, ritardo=350, al_clic=True):
+        self.widget, self.testo, self.ritardo = widget, testo, ritardo
+        self._tip = self._job = None
+        widget.bind("<Enter>", self._pianifica, add="+")
+        widget.bind("<Leave>", self._nascondi, add="+")
+        if al_clic:      # sulle icone ⓘ; sui pulsanti il clic esegue l'azione
+            widget.bind("<Button-1>", self._alterna, add="+")
+        else:
+            widget.bind("<Button-1>", self._nascondi, add="+")
+
+    def _pianifica(self, _=None):
+        self._annulla()
+        self._job = self.widget.after(self.ritardo, self._mostra)
+
+    def _annulla(self):
+        if self._job:
+            try:
+                self.widget.after_cancel(self._job)
+            except Exception:
+                pass
+            self._job = None
+
+    def _mostra(self):
+        self._job = None
+        if self._tip or not self.widget.winfo_exists():
+            return
+        tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        try:
+            tw.attributes("-topmost", True)
+        except Exception:
+            pass
+        tk.Label(tw, text=self.testo, justify="left", wraplength=360,
+                 bg="#333740", fg="#f2f2f2", relief="solid", bd=1,
+                 padx=9, pady=6, font=("TkDefaultFont", 11)).pack()
+        tw.update_idletasks()
+        x = self.widget.winfo_rootx() + 16
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        sw, sh = tw.winfo_screenwidth(), tw.winfo_screenheight()
+        x = min(x, sw - tw.winfo_reqwidth() - 8)
+        if y + tw.winfo_reqheight() > sh - 8:
+            y = self.widget.winfo_rooty() - tw.winfo_reqheight() - 4
+        tw.wm_geometry(f"+{max(0, x)}+{max(0, y)}")
+        tw.lift()
+        self._tip = tw
+
+    def _nascondi(self, _=None):
+        self._annulla()
+        if self._tip:
+            try:
+                self._tip.destroy()
+            except Exception:
+                pass
+            self._tip = None
+
+    def _alterna(self, _=None):
+        if self._tip:
+            self._nascondi()
+        else:
+            self._annulla()
+            self._mostra()
+
+
+def _icona_info(parent, testo):
+    """Piccola icona ⓘ con tooltip."""
+    ico = ctk.CTkLabel(parent, text="ⓘ", width=14, cursor="hand2",
+                       text_color=("#1f6aa5", "#5fa8e8"), font=ctk.CTkFont(size=13))
+    Tooltip(ico, testo)
+    return ico
+
+
+def _carica_impostazioni():
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+            dati = json.load(f)
+        return dati if isinstance(dati, dict) else {}
+    except Exception:
+        return {}
+
+
+def _prossimo_indice_raw(raw_dir):
+    numeri = []
+    if os.path.isdir(raw_dir):
+        for f in os.listdir(raw_dir):
+            m = re.match(r"^(\d+)_", f)
+            if m:
+                numeri.append(int(m.group(1)))
+    return max(numeri, default=0) + 1
+
 
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("Audio Splitter & Transcriber")
-        self.geometry("700x920")
-        self.minsize(650, 820)
+        self.title("From Video to Wiki")
+        self._configura_finestra()
 
         self.cartella_segmenti = None
         self.in_esecuzione = False
         self.video_size_mb = 0.0
         self.tempo_splitting = 0.0
         self.tempo_trascrizione = 0.0
+        self._video_path = None
+        self._cartella_video_batch = None
+        self._kb_path = None
 
         # Eventi per stop e pausa
         self.stop_event = threading.Event()
         self.pause_event = threading.Event()
 
+        # Stato modelli LLM
+        self._imp = _carica_impostazioni()
+        self._modelli_custom = [t for t in self._imp.get("llm_custom", [])
+                                if isinstance(t, str) and t.strip()]
+        self._llm_specs = {}
+        self._ollama_ok = None           # None = verifica in corso
+        self._ollama_installati = None   # set di nomi normalizzati
+        self._llm_label_prec = llm.DEFAULT_LLM_LABEL
+
         # Grid principale: la riga del log si espande
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(4, weight=1)
+        self.grid_rowconfigure(3, weight=1)
 
         self._crea_header()
-        self._crea_sezione_video()
-        self._crea_sezione_trascrizione()
-        self._crea_sezione_batch()
+        if self._schermo_piccolo:
+            # Schermi bassi (es. laptop Windows 1080p al 125-150%): i blocchi
+            # superiori diventano scorrevoli e il log resta sempre visibile.
+            contenitore = ctk.CTkScrollableFrame(self, fg_color="transparent",
+                                                 height=self._altezza_scroll)
+            contenitore.grid(row=1, column=0, rowspan=2, padx=0, pady=0, sticky="nsew")
+            contenitore.grid_columnconfigure(0, weight=1)
+            self._crea_sezione_impostazioni(contenitore, 0)
+            self._crea_sezioni_operative(contenitore, 1)
+        else:
+            self._crea_sezione_impostazioni(self, 1)
+            self._crea_sezioni_operative(self, 2)
         self._crea_sezione_log()
         self._crea_status_bar()
+
+        self._applica_impostazioni()
+        self._aggiorna_menu_modelli()
+        self._aggiorna_stato_bottoni(False)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(200, self._aggiorna_modelli_locali)
+        self.after(100, self._carica_info_sistema)
+
+    def _configura_finestra(self):
+        """Dimensiona la finestra sullo schermo reale. Su Windows con scaling
+        DPI (125%/150%) Tk riporta pixel fisici: si ragiona in pixel logici."""
+        try:
+            scala = float(ctk.ScalingTracker.get_window_scaling(self)) or 1.0
+        except Exception:
+            scala = 1.0
+        sw = int(self.winfo_screenwidth() / scala)
+        sh = int(self.winfo_screenheight() / scala)
+        w = max(900, min(1280, sw - 40))
+        h = max(600, min(880, sh - 90))
+        self.geometry(f"{w}x{h}")
+        self.minsize(min(1100, w), min(640, h))
+        self._schermo_piccolo = sh < 960
+        self._altezza_scroll = max(280, h - 330)
+
+    def _carica_info_sistema(self):
+        def lavoro():
+            testo = "🖥  " + perf.descrizione_breve()
+            self.after(0, lambda: self.lbl_sistema.configure(text=testo))
+        threading.Thread(target=lavoro, daemon=True).start()
+
+    # -------------------------------------------------------------------
+    # Helper widget
+    # -------------------------------------------------------------------
+    @staticmethod
+    def _label(parent, testo, row, col, padx=(12, 5), pady=4, info=None):
+        """Etichetta di un parametro + icona ⓘ con la spiegazione (se prevista)."""
+        info = info or INFO_PARAMETRI.get(testo)
+        if not info:
+            lbl = ctk.CTkLabel(parent, text=testo, anchor="w")
+            lbl.grid(row=row, column=col, padx=padx, pady=pady, sticky="w")
+            return lbl
+        box = ctk.CTkFrame(parent, fg_color="transparent")
+        box.grid(row=row, column=col, padx=padx, pady=pady, sticky="w")
+        lbl = ctk.CTkLabel(box, text=testo, anchor="w")
+        lbl.pack(side="left")
+        _icona_info(box, info).pack(side="left", padx=(3, 0))
+        return lbl
+
+    @staticmethod
+    def _titolo(parent, testo, columnspan, size=14):
+        ctk.CTkLabel(parent, text=testo, anchor="w",
+                     font=ctk.CTkFont(size=size, weight="bold"),
+                     ).grid(row=0, column=0, columnspan=columnspan,
+                            padx=15 if size == 14 else 12,
+                            pady=(10, 6) if size == 14 else (8, 4), sticky="w")
+
+    @staticmethod
+    def _nota_dim(parent, testo, row, columnspan, wraplength=500):
+        ctk.CTkLabel(parent, text=testo, text_color=COLORE_TESTO_DIM,
+                     font=ctk.CTkFont(size=11), anchor="w", justify="left",
+                     wraplength=wraplength,
+                     ).grid(row=row, column=0, columnspan=columnspan,
+                            padx=15, pady=(2, 10), sticky="w")
+
+    @staticmethod
+    def _set_entry(entry, testo):
+        entry.configure(state="normal")
+        entry.delete(0, "end")
+        if testo:
+            entry.insert(0, testo)
+        entry.configure(state="readonly")
+
+    def _bottone_grigio(self, parent, testo, comando, width=40):
+        return ctk.CTkButton(parent, text=testo, width=width, command=comando,
+                             fg_color=COLORE_GRIGIO, hover_color="#5a5a5a")
 
     # -------------------------------------------------------------------
     # Header
     # -------------------------------------------------------------------
     def _crea_header(self):
         header = ctk.CTkFrame(self, fg_color="transparent")
-        header.grid(row=0, column=0, padx=20, pady=(15, 5), sticky="ew")
+        header.grid(row=0, column=0, padx=20, pady=(12, 4), sticky="ew")
 
         ctk.CTkLabel(
-            header, text="🎬  Audio Splitter & Transcriber",
+            header, text="🎬  From Video to Wiki",
             font=ctk.CTkFont(size=22, weight="bold"),
         ).pack(side="left")
+        ctk.CTkLabel(
+            header, text="  estrai · trascrivi · sintetizza · costruisci la tua knowledge base",
+            text_color=COLORE_TESTO_DIM, font=ctk.CTkFont(size=12),
+        ).pack(side="left", padx=(8, 0), pady=(6, 0))
 
-        self.tema_var = ctk.StringVar(value="dark")
         ctk.CTkSegmentedButton(
             header, values=["☀️ Light", "🌙 Dark"],
             command=self._cambia_tema,
             font=ctk.CTkFont(size=12),
             selected_color=COLORE_ACCENT,
         ).pack(side="right")
+        self.lbl_sistema = ctk.CTkLabel(header, text="🖥  …", text_color=COLORE_TESTO_DIM,
+                                        font=ctk.CTkFont(size=11))
+        self.lbl_sistema.pack(side="right", padx=(0, 14), pady=(6, 0))
 
     def _cambia_tema(self, scelta):
         modo = "light" if "Light" in scelta else "dark"
         ctk.set_appearance_mode(modo)
 
     # -------------------------------------------------------------------
-    # Sezione 1: Video → Splitting
+    # Sezione 1: Impostazioni (trascrizione + LLM)
     # -------------------------------------------------------------------
-    def _crea_sezione_video(self):
-        frame = ctk.CTkFrame(self)
-        frame.grid(row=1, column=0, padx=20, pady=(5, 5), sticky="ew")
-        frame.grid_columnconfigure(0, weight=1)
+    def _crea_sezione_impostazioni(self, parent, row):
+        frame = ctk.CTkFrame(parent)
+        frame.grid(row=row, column=0, padx=20, pady=(4, 5), sticky="ew")
+        frame.grid_columnconfigure(0, weight=0)   # trascrizione: larghezza naturale
+        frame.grid_columnconfigure(1, weight=1)   # LLM: prende lo spazio restante
+        self._titolo(frame, "1 │ Impostazioni", columnspan=2)
 
-        ctk.CTkLabel(
-            frame, text="1 │ Estrazione & Segmentazione (singolo video)",
-            font=ctk.CTkFont(size=14, weight="bold"),
-            anchor="w",
-        ).grid(row=0, column=0, columnspan=3, padx=15, pady=(12, 8), sticky="w")
+        # ---------------- Trascrizione (faster-whisper) ----------------
+        wh = ctk.CTkFrame(frame, fg_color=COLORE_SOTTOFRAME, corner_radius=8)
+        wh.grid(row=1, column=0, padx=(15, 6), pady=(0, 12), sticky="nsew")
+        self._titolo(wh, "🎙  Trascrizione · faster-whisper", columnspan=4, size=13)
 
-        ctk.CTkLabel(frame, text="Video:", anchor="w").grid(
-            row=1, column=0, padx=(15, 5), pady=4, sticky="w")
+        self._label(wh, "Modello:", 1, 0)
+        self.modello_var = ctk.StringVar(value="large-v3-turbo")
+        ctk.CTkOptionMenu(wh, variable=self.modello_var, values=MODELLI_WHISPER,
+                          width=130).grid(row=1, column=1, padx=5, pady=4, sticky="w")
 
-        self.entry_video = ctk.CTkEntry(
-            frame, placeholder_text="Seleziona un file video...",
-            state="readonly", width=380,
-        )
-        self.entry_video.grid(row=1, column=1, padx=5, pady=4, sticky="ew")
-        frame.grid_columnconfigure(1, weight=1)
+        self._label(wh, "Lingua:", 1, 2)
+        self.lingua_var = ctk.StringVar(value="Auto-detect")
+        ctk.CTkOptionMenu(wh, variable=self.lingua_var, values=LINGUE_WHISPER,
+                          width=130).grid(row=1, column=3, padx=(5, 12), pady=4, sticky="w")
 
-        ctk.CTkButton(
-            frame, text="📁 Sfoglia", width=100,
-            command=self._browse_file,
-            fg_color=COLORE_GRIGIO, hover_color="#5a5a5a",
-        ).grid(row=1, column=2, padx=(5, 15), pady=4)
+        self._label(wh, "Formato:", 2, 0)
+        self.formato_var = ctk.StringVar(value="txt")
+        ctk.CTkOptionMenu(wh, variable=self.formato_var, values=["txt", "dettagliato"],
+                          width=130).grid(row=2, column=1, padx=5, pady=4, sticky="w")
 
-        row_split = ctk.CTkFrame(frame, fg_color="transparent")
-        row_split.grid(row=2, column=0, columnspan=3, padx=15, pady=(4, 12),
-                       sticky="ew")
+        self._label(wh, "Device:", 2, 2)
+        self.device_var = ctk.StringVar(value="auto")
+        ctk.CTkOptionMenu(wh, variable=self.device_var, values=DEVICE_SCELTE,
+                          width=130).grid(row=2, column=3, padx=(5, 12), pady=4, sticky="w")
 
-        ctk.CTkLabel(row_split, text="Max MB/segmento:").pack(
-            side="left", padx=(0, 5))
-
-        self.size_entry = ctk.CTkEntry(row_split, width=70, justify="center")
-        self.size_entry.pack(side="left", padx=(0, 5))
+        self._label(wh, "MB/segmento:", 3, 0)
+        self.size_entry = ctk.CTkEntry(wh, width=70, justify="center")
+        self.size_entry.grid(row=3, column=1, padx=5, pady=4, sticky="w")
         self.size_entry.insert(0, "5")
 
-        ctk.CTkLabel(
-            row_split, text="(es. 25 = ~25 MB)",
-            text_color=COLORE_TESTO_DIM, font=ctk.CTkFont(size=11),
-        ).pack(side="left", padx=(0, 15))
-
-        self.btn_elabora_e_trascrivi = ctk.CTkButton(
-            row_split, text="⚡ Elabora + Trascrivi",
-            command=self._process_video_e_trascrivi,
-            fg_color=COLORE_ARANCIO, hover_color="#b5651d",
-            font=ctk.CTkFont(size=13, weight="bold"), height=36,
-        )
-        self.btn_elabora_e_trascrivi.pack(side="right", padx=(5, 0))
-
-        self.btn_elabora = ctk.CTkButton(
-            row_split, text="▶  Elabora Video",
-            command=self._process_video,
-            fg_color=COLORE_ACCENT, hover_color="#174f7a",
-            font=ctk.CTkFont(size=13, weight="bold"), height=36,
-        )
-        self.btn_elabora.pack(side="right")
-
-    # -------------------------------------------------------------------
-    # Sezione 2: Trascrizione
-    # -------------------------------------------------------------------
-    def _crea_sezione_trascrizione(self):
-        frame = ctk.CTkFrame(self)
-        frame.grid(row=2, column=0, padx=20, pady=5, sticky="ew")
-        frame.grid_columnconfigure(1, weight=1)
-
-        ctk.CTkLabel(
-            frame, text="2 │ Trascrizione (faster-whisper)",
-            font=ctk.CTkFont(size=14, weight="bold"), anchor="w",
-        ).grid(row=0, column=0, columnspan=4, padx=15, pady=(12, 8), sticky="w")
-
-        ctk.CTkLabel(frame, text="Modello:").grid(
-            row=1, column=0, padx=(15, 5), pady=4, sticky="w")
-        self.modello_var = ctk.StringVar(value="large-v3-turbo")
-        ctk.CTkOptionMenu(
-            frame, variable=self.modello_var, values=MODELLI_WHISPER, width=160,
-        ).grid(row=1, column=1, padx=5, pady=4, sticky="w")
-
-        ctk.CTkLabel(frame, text="Lingua:").grid(
-            row=1, column=2, padx=(15, 5), pady=4, sticky="w")
-        self.lingua_var = ctk.StringVar(value="Auto-detect")
-        ctk.CTkOptionMenu(
-            frame, variable=self.lingua_var, width=160,
-            values=["Auto-detect", "it (Italiano)", "en (English)"],
-        ).grid(row=1, column=3, padx=(5, 15), pady=4, sticky="w")
-
-        ctk.CTkLabel(frame, text="Formato:").grid(
-            row=2, column=0, padx=(15, 5), pady=4, sticky="w")
-        self.formato_var = ctk.StringVar(value="txt")
-        ctk.CTkOptionMenu(
-            frame, variable=self.formato_var, values=["txt", "dettagliato"],
-            width=160,
-        ).grid(row=2, column=1, padx=5, pady=4, sticky="w")
-
-        ctk.CTkLabel(frame, text="Device:").grid(
-            row=2, column=2, padx=(15, 5), pady=4, sticky="w")
-        self.device_var = ctk.StringVar(value="auto")
-        ctk.CTkOptionMenu(
-            frame, variable=self.device_var, values=["auto", "cpu", "cuda"],
-            width=160,
-        ).grid(row=2, column=3, padx=(5, 15), pady=4, sticky="w")
-
-        row_btns = ctk.CTkFrame(frame, fg_color="transparent")
-        row_btns.grid(row=3, column=0, columnspan=4, padx=15, pady=(8, 12),
-                      sticky="ew")
-
-        self.btn_trascrivi = ctk.CTkButton(
-            row_btns, text="🎙  Trascrivi Segmenti",
-            command=self._trascrivi_segmenti,
-            fg_color=COLORE_VERDE, hover_color="#1e6b43",
-            font=ctk.CTkFont(size=13, weight="bold"), height=36,
-        )
-        self.btn_trascrivi.pack(side="left", padx=(0, 10))
-
-        self.btn_trascrivi_cartella = ctk.CTkButton(
-            row_btns, text="📂  Trascrivi da Cartella...",
-            command=self._trascrivi_da_cartella,
-            fg_color=COLORE_VERDE, hover_color="#1e6b43",
-            font=ctk.CTkFont(size=13, weight="bold"), height=36,
-        )
-        self.btn_trascrivi_cartella.pack(side="left")
+        self._label(wh, "Thread CPU:", 3, 2)
+        self.whisper_thread_var = ctk.StringVar(value=THREAD_WHISPER_AUTO)
+        ctk.CTkOptionMenu(wh, variable=self.whisper_thread_var, values=THREAD_WHISPER_SCELTE,
+                          width=130).grid(row=3, column=3, padx=(5, 12), pady=4, sticky="w")
 
         if not WHISPER_DISPONIBILE:
-            self.btn_trascrivi.configure(state="disabled")
-            self.btn_trascrivi_cartella.configure(state="disabled")
-            self.btn_elabora_e_trascrivi.configure(state="disabled")
             ctk.CTkLabel(
-                frame,
-                text="⚠  faster-whisper non installato — pip install faster-whisper",
+                wh, text="⚠  faster-whisper non installato — pip install faster-whisper",
                 text_color=COLORE_ROSSO, font=ctk.CTkFont(size=11),
-            ).grid(row=4, column=0, columnspan=4, padx=15, pady=(0, 8), sticky="w")
+            ).grid(row=5, column=0, columnspan=4, padx=12, pady=(0, 8), sticky="w")
+
+        # ---------------- Sintesi (LLM open source) ----------------
+        lf = ctk.CTkFrame(frame, fg_color=COLORE_SOTTOFRAME, corner_radius=8)
+        lf.grid(row=1, column=1, padx=(6, 15), pady=(0, 12), sticky="nsew")
+        lf.grid_columnconfigure(5, weight=1)
+        self._titolo(lf, "🧠  Sintesi · LLM open source in locale", columnspan=6, size=13)
+
+        self._label(lf, "Modello:", 1, 0, info=INFO_PARAMETRI["Modello LLM:"])
+        rm = ctk.CTkFrame(lf, fg_color="transparent")
+        rm.grid(row=1, column=1, columnspan=5, padx=5, pady=4, sticky="w")
+        self.llm_modello_var = ctk.StringVar(value=llm.DEFAULT_LLM_LABEL)
+        self.llm_menu = ctk.CTkOptionMenu(
+            rm, variable=self.llm_modello_var, values=[llm.DEFAULT_LLM_LABEL],
+            width=340, dynamic_resizing=False, command=self._on_llm_scelto)
+        self.llm_menu.pack(side="left")
+        self.btn_llm_scarica = self._bottone_grigio(rm, "⬇ Scarica", self._scarica_modello_llm, 90)
+        self.btn_llm_scarica.pack(side="left", padx=(8, 0))
+        self.btn_llm_refresh = self._bottone_grigio(rm, "↻", self._aggiorna_modelli_locali, 34)
+        self.btn_llm_refresh.pack(side="left", padx=(6, 0))
+        Tooltip(self.btn_llm_scarica, INFO_PARAMETRI["scarica"], al_clic=False)
+        Tooltip(self.btn_llm_refresh, INFO_PARAMETRI["refresh"], al_clic=False)
+
+        self.llm_info = ctk.CTkLabel(lf, text="", text_color=COLORE_TESTO_DIM,
+                                     font=ctk.CTkFont(size=11), anchor="w",
+                                     justify="left", wraplength=560)
+        self.llm_info.grid(row=2, column=0, columnspan=6, padx=12, pady=(0, 2), sticky="w")
+
+        self._label(lf, "Tipo contenuto:", 3, 0)
+        self.llm_tipo_var = ctk.StringVar(value=llm.DEFAULT_TIPO)
+        ctk.CTkOptionMenu(lf, variable=self.llm_tipo_var, values=list(llm.TIPI_NOTA),
+                          width=220, dynamic_resizing=False,
+                          ).grid(row=3, column=1, columnspan=2, padx=5, pady=4, sticky="w")
+
+        self._label(lf, "Lingua nota:", 3, 3)
+        self.llm_lingua_var = ctk.StringVar(value="Italiano")
+        ctk.CTkOptionMenu(lf, variable=self.llm_lingua_var, values=list(llm.LINGUE_NOTA),
+                          width=160).grid(row=3, column=4, columnspan=2, padx=(5, 12),
+                                          pady=4, sticky="w")
+
+        self._label(lf, "Contesto:", 4, 0, pady=4)
+        self.llm_ctx_var = ctk.StringVar(value="Auto")
+        ctk.CTkOptionMenu(lf, variable=self.llm_ctx_var, values=list(CTX_SCELTE), width=90,
+                          command=lambda _: self._aggiorna_info_llm(),
+                          ).grid(row=4, column=1, padx=5, pady=4, sticky="w")
+
+        self._label(lf, "Max output:", 4, 2, padx=(10, 5))
+        self.llm_maxout_var = ctk.StringVar(value="4096")
+        ctk.CTkOptionMenu(lf, variable=self.llm_maxout_var, values=MAX_OUTPUT_SCELTE,
+                          width=90).grid(row=4, column=3, padx=5, pady=4, sticky="w")
+
+        self._label(lf, "Temperatura:", 4, 4, padx=(10, 5))
+        self.llm_temp_entry = ctk.CTkEntry(lf, width=60, justify="center")
+        self.llm_temp_entry.grid(row=4, column=5, padx=(5, 12), pady=4, sticky="w")
+        self.llm_temp_entry.insert(0, "0.3")
+
+        self._label(lf, "Thread LLM:", 5, 0, pady=(0, 10))
+        self.llm_thread_var = ctk.StringVar(value="Auto")
+        ctk.CTkOptionMenu(lf, variable=self.llm_thread_var, values=THREAD_LLM_SCELTE, width=90,
+                          ).grid(row=5, column=1, padx=5, pady=(0, 10), sticky="w")
+        self._label(lf, "Accelerazione:", 5, 2, padx=(10, 5), pady=(0, 10))
+        self.llm_accel_var = ctk.StringVar(value=list(ACCEL_SCELTE)[0])
+        ctk.CTkOptionMenu(lf, variable=self.llm_accel_var, values=list(ACCEL_SCELTE), width=200,
+                          command=lambda _: self._aggiorna_info_llm(),
+                          ).grid(row=5, column=3, columnspan=3, padx=5, pady=(0, 10), sticky="w")
 
     # -------------------------------------------------------------------
-    # Sezione 3: Batch cartella → LLM Wiki
+    # Sezioni 2 e 3 affiancate
     # -------------------------------------------------------------------
-    def _crea_sezione_batch(self):
-        frame = ctk.CTkFrame(self)
-        frame.grid(row=3, column=0, padx=20, pady=5, sticky="ew")
+    def _crea_sezioni_operative(self, parent, row):
+        riga = ctk.CTkFrame(parent, fg_color="transparent")
+        riga.grid(row=row, column=0, padx=20, pady=5, sticky="ew")
+        riga.grid_columnconfigure((0, 1), weight=1, uniform="op")
+        self._crea_sezione_singolo(riga)
+        self._crea_sezione_wiki(riga)
+
+    # Sezione 2: singolo contenuto ---------------------------------------
+    def _crea_sezione_singolo(self, parent):
+        frame = ctk.CTkFrame(parent)
+        frame.grid(row=0, column=0, padx=(0, 5), sticky="nsew")
         frame.grid_columnconfigure(1, weight=1)
+        self._titolo(frame, "2 │ Singolo contenuto  ·  estrai → trascrivi → nota", columnspan=3)
 
-        ctk.CTkLabel(
-            frame, text="3 │ Batch Cartella → LLM Wiki",
-            font=ctk.CTkFont(size=14, weight="bold"), anchor="w",
-        ).grid(row=0, column=0, columnspan=3, padx=15, pady=(12, 8), sticky="w")
+        self._label(frame, "Video:", 1, 0, padx=(15, 5))
+        self.entry_video = ctk.CTkEntry(frame, placeholder_text="Seleziona un file video...",
+                                        state="readonly")
+        self.entry_video.grid(row=1, column=1, padx=5, pady=4, sticky="ew")
+        self._bottone_grigio(frame, "📁", self._browse_file).grid(
+            row=1, column=2, padx=(5, 15), pady=4, sticky="w")
 
-        ctk.CTkLabel(frame, text="Cartella video:", anchor="w").grid(
-            row=1, column=0, padx=(15, 5), pady=4, sticky="w")
+        self._label(frame, "Knowledge base:", 2, 0, padx=(15, 5))
+        self.entry_kb = ctk.CTkEntry(
+            frame, placeholder_text="(opzionale) cartella Wiki in cui archiviare le note",
+            state="readonly")
+        self.entry_kb.grid(row=2, column=1, padx=5, pady=4, sticky="ew")
+        kb_btns = ctk.CTkFrame(frame, fg_color="transparent")
+        kb_btns.grid(row=2, column=2, padx=(5, 15), pady=4, sticky="w")
+        self._bottone_grigio(kb_btns, "📁", self._browse_kb).pack(side="left")
+        self._bottone_grigio(kb_btns, "✕", self._rimuovi_kb, 30).pack(side="left", padx=(4, 0))
 
-        self.entry_cartella_video = ctk.CTkEntry(
-            frame, placeholder_text="Seleziona una cartella con più video...",
-            state="readonly",
-        )
-        self.entry_cartella_video.grid(row=1, column=1, padx=5, pady=4, sticky="ew")
-
-        ctk.CTkButton(
-            frame, text="📁 Sfoglia", width=100,
-            command=self._browse_cartella_video,
-            fg_color=COLORE_GRIGIO, hover_color="#5a5a5a",
-        ).grid(row=1, column=2, padx=(5, 15), pady=4)
-
-        row_b = ctk.CTkFrame(frame, fg_color="transparent")
-        row_b.grid(row=2, column=0, columnspan=3, padx=15, pady=(4, 12), sticky="ew")
-
-        self.wiki_var = ctk.BooleanVar(value=True)
+        self.nota_var = ctk.BooleanVar(value=True)
+        riga_nota = ctk.CTkFrame(frame, fg_color="transparent")
+        riga_nota.grid(row=3, column=0, columnspan=3, padx=15, pady=(6, 4), sticky="w")
         ctk.CTkCheckBox(
-            row_b, text="Genera struttura LLM Wiki (raw/ + wiki/ + CLAUDE.md)",
-            variable=self.wiki_var, font=ctk.CTkFont(size=12),
+            riga_nota, text="🧠 Genera nota .md con LLM (modello e tipo dalle Impostazioni)",
+            variable=self.nota_var, command=self._aggiorna_testo_bottoni,
+            font=ctk.CTkFont(size=12),
         ).pack(side="left")
+        _icona_info(riga_nota, INFO_PARAMETRI["nota"]).pack(side="left", padx=(4, 0))
+
+        r1 = ctk.CTkFrame(frame, fg_color="transparent")
+        r1.grid(row=4, column=0, columnspan=3, padx=15, pady=4, sticky="ew")
+        self.btn_elabora = ctk.CTkButton(
+            r1, text="▶  Solo estrai audio", command=self._process_video,
+            fg_color=COLORE_ACCENT, hover_color="#174f7a",
+            font=ctk.CTkFont(size=13, weight="bold"), height=36)
+        self.btn_elabora.pack(side="left", padx=(0, 6))
+        self.btn_elabora_e_trascrivi = ctk.CTkButton(
+            r1, text="⚡ Elabora + Trascrivi + Nota", command=self._process_video_e_trascrivi,
+            fg_color=COLORE_ARANCIO, hover_color="#b5651d",
+            font=ctk.CTkFont(size=13, weight="bold"), height=36)
+        self.btn_elabora_e_trascrivi.pack(side="left", expand=True, fill="x")
+
+        r2 = ctk.CTkFrame(frame, fg_color="transparent")
+        r2.grid(row=5, column=0, columnspan=3, padx=15, pady=4, sticky="ew")
+        self.btn_trascrivi = ctk.CTkButton(
+            r2, text="🎙 Trascrivi segmenti", command=self._trascrivi_segmenti,
+            fg_color=COLORE_VERDE, hover_color="#1e6b43", height=32)
+        self.btn_trascrivi.pack(side="left", expand=True, fill="x", padx=(0, 6))
+        self.btn_trascrivi_cartella = ctk.CTkButton(
+            r2, text="📂 Da cartella audio…", command=self._trascrivi_da_cartella,
+            fg_color=COLORE_VERDE, hover_color="#1e6b43", height=32)
+        self.btn_trascrivi_cartella.pack(side="left", expand=True, fill="x", padx=(0, 6))
+        self.btn_nota_txt = ctk.CTkButton(
+            r2, text="📝 Nota da trascrizione…", command=self._nota_da_file,
+            fg_color=COLORE_TEAL, hover_color="#0f5f66", height=32)
+        self.btn_nota_txt.pack(side="left", expand=True, fill="x")
+
+        self._nota_dim(
+            frame,
+            "Senza knowledge base la nota è salvata accanto alla trascrizione. Con una "
+            "knowledge base viene anche archiviata nella Wiki (raw/ + wiki/ + concetti + "
+            "index), che cresce a ogni nuovo contenuto.",
+            row=6, columnspan=3)
+
+    # Sezione 3: Knowledge base / Wiki ------------------------------------
+    def _crea_sezione_wiki(self, parent):
+        frame = ctk.CTkFrame(parent)
+        frame.grid(row=0, column=1, padx=(5, 0), sticky="nsew")
+        frame.grid_columnconfigure(1, weight=1)
+        self._titolo(frame, "3 │ Knowledge Base  ·  cartella → LLM Wiki", columnspan=3)
+
+        self._label(frame, "Cartella video:", 1, 0, padx=(15, 5))
+        self.entry_cartella_video = ctk.CTkEntry(
+            frame, placeholder_text="Seleziona una cartella con più video...", state="readonly")
+        self.entry_cartella_video.grid(row=1, column=1, padx=5, pady=4, sticky="ew")
+        self._bottone_grigio(frame, "📁", self._browse_cartella_video).grid(
+            row=1, column=2, padx=(5, 15), pady=4, sticky="w")
+
+        self._label(frame, "Cervello Wiki:", 2, 0, padx=(15, 5))
+        self.wiki_brain_var = ctk.StringVar(value=BRAIN_UGUALE)
+        self.wiki_brain_menu = ctk.CTkOptionMenu(
+            frame, variable=self.wiki_brain_var, values=[BRAIN_UGUALE],
+            dynamic_resizing=False, fg_color=COLORE_VIOLA, button_color="#633974",
+            button_hover_color="#4f2d5c")
+        self.wiki_brain_menu.grid(row=2, column=1, columnspan=2, padx=(5, 15), pady=4, sticky="ew")
+
+        checks = ctk.CTkFrame(frame, fg_color="transparent")
+        checks.grid(row=3, column=0, columnspan=3, padx=15, pady=(6, 4), sticky="w")
+        self.wiki_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(checks, text="Genera struttura Wiki (raw/ + wiki/)",
+                        variable=self.wiki_var, font=ctk.CTkFont(size=12),
+                        ).pack(side="left")
+        _icona_info(checks, INFO_PARAMETRI["struttura"]).pack(side="left", padx=(4, 16))
+        self.wiki_ingest_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(checks, text="🧠 Ingest automatico con LLM",
+                        variable=self.wiki_ingest_var, font=ctk.CTkFont(size=12),
+                        ).pack(side="left")
+        _icona_info(checks, INFO_PARAMETRI["ingest"]).pack(side="left", padx=(4, 0))
 
         self.btn_batch = ctk.CTkButton(
-            row_b, text="🚀 Elabora Cartella + Wiki",
-            command=self._elabora_cartella_batch,
+            frame, text="🚀 Elabora Cartella + Wiki", command=self._elabora_cartella_batch,
             fg_color=COLORE_VIOLA, hover_color="#633974",
-            font=ctk.CTkFont(size=13, weight="bold"), height=36,
-        )
-        self.btn_batch.pack(side="right")
+            font=ctk.CTkFont(size=13, weight="bold"), height=36)
+        self.btn_batch.grid(row=4, column=0, columnspan=3, padx=15, pady=4, sticky="ew")
 
-        ctk.CTkLabel(
+        r2 = ctk.CTkFrame(frame, fg_color="transparent")
+        r2.grid(row=5, column=0, columnspan=3, padx=15, pady=4, sticky="ew")
+        self.btn_ingest_wiki = ctk.CTkButton(
+            r2, text="🧠 Ingest Wiki esistente…", command=self._ingest_wiki_esistente,
+            fg_color=COLORE_TEAL, hover_color="#0f5f66", height=32)
+        self.btn_ingest_wiki.pack(side="left", expand=True, fill="x", padx=(0, 6))
+        self.btn_chiedi_wiki = ctk.CTkButton(
+            r2, text="💬 Chiedi alla Wiki…", command=self._chiedi_alla_wiki,
+            fg_color=COLORE_TEAL, hover_color="#0f5f66", height=32)
+        self.btn_chiedi_wiki.pack(side="left", expand=True, fill="x")
+
+        self._nota_dim(
             frame,
-            text="Usa modello/lingua/formato/device della sezione 2 e i MB/segmento "
-                 "della sezione 1. Output: una cartella '_Wiki_<nome>' con tutte le trascrizioni.",
-            text_color=COLORE_TESTO_DIM, font=ctk.CTkFont(size=11),
-            anchor="w", justify="left", wraplength=620,
-        ).grid(row=3, column=0, columnspan=3, padx=15, pady=(0, 10), sticky="w")
-
-        if not WHISPER_DISPONIBILE:
-            self.btn_batch.configure(state="disabled")
+            "Output in '<cartella>/_Wiki_<nome>'. Il cervello legge le trascrizioni in raw/, "
+            "scrive una sintesi per fonte, crea pagine concetto/entità collegate e aggiorna "
+            "index e log. Anche le risposte alle domande vengono archiviate nella Wiki.",
+            row=6, columnspan=3)
 
     # -------------------------------------------------------------------
-    # Sezione 4: Log + Progress + Controlli Pausa/Stop
+    # Log + Progress + Controlli Pausa/Stop
     # -------------------------------------------------------------------
     def _crea_sezione_log(self):
         frame = ctk.CTkFrame(self)
-        frame.grid(row=4, column=0, padx=20, pady=5, sticky="nsew")
+        frame.grid(row=3, column=0, padx=20, pady=5, sticky="nsew")
         frame.grid_rowconfigure(2, weight=1)
         frame.grid_columnconfigure(0, weight=1)
 
@@ -1335,7 +1748,6 @@ class App(ctk.CTk):
             font=ctk.CTkFont(size=13, weight="bold"),
         ).grid(row=0, column=0, sticky="w")
 
-        # Pulsanti Pausa e Stop
         self.ctrl_frame = ctk.CTkFrame(top_row, fg_color="transparent")
         self.ctrl_frame.grid(row=0, column=1, sticky="e")
 
@@ -1345,7 +1757,6 @@ class App(ctk.CTk):
             fg_color=COLORE_GIALLO, hover_color="#9a7209",
             font=ctk.CTkFont(size=12, weight="bold"), height=30,
         )
-
         self.btn_stop = ctk.CTkButton(
             self.ctrl_frame, text="⏹ Stop", width=90,
             command=self._richiedi_stop,
@@ -1358,35 +1769,443 @@ class App(ctk.CTk):
         self.progress.set(0)
 
         self.log_text = ctk.CTkTextbox(
-            frame, font=ctk.CTkFont(family="Consolas", size=12),
+            frame, font=ctk.CTkFont(family=FONT_LOG, size=12),
             activate_scrollbars=True, wrap="word",
             fg_color=COLORE_SFONDO_LOG, text_color=COLORE_TESTO_LOG,
-            corner_radius=8,
+            corner_radius=8, height=110,
         )
         self.log_text.grid(row=2, column=0, padx=15, pady=(0, 12), sticky="nsew")
+        try:  # il tk.Text interno chiede 24 righe: lasciamo che sia la griglia a espanderlo
+            self.log_text._textbox.configure(height=4)
+        except Exception:
+            pass
 
-    # -------------------------------------------------------------------
-    # Status bar
-    # -------------------------------------------------------------------
     def _crea_status_bar(self):
         self.status_label = ctk.CTkLabel(
             self, text="  Pronto",
             font=ctk.CTkFont(size=11),
             text_color=COLORE_TESTO_DIM, anchor="w",
         )
-        self.status_label.grid(row=5, column=0, padx=20, pady=(0, 8), sticky="ew")
+        self.status_label.grid(row=4, column=0, padx=20, pady=(0, 8), sticky="ew")
+
+    # ===================================================================
+    # Impostazioni persistenti
+    # ===================================================================
+    def _applica_impostazioni(self):
+        imp = self._imp
+
+        def _set(var, chiave, valori):
+            v = imp.get(chiave)
+            if v is not None and v in valori:
+                var.set(v)
+
+        _set(self.modello_var, "whisper_modello", MODELLI_WHISPER)
+        _set(self.lingua_var, "whisper_lingua", LINGUE_WHISPER)
+        _set(self.formato_var, "whisper_formato", ["txt", "dettagliato"])
+        _set(self.device_var, "whisper_device", DEVICE_SCELTE)
+        _set(self.whisper_thread_var, "whisper_thread", THREAD_WHISPER_SCELTE)
+        _set(self.llm_thread_var, "llm_thread", THREAD_LLM_SCELTE)
+        _set(self.llm_accel_var, "llm_accelerazione", list(ACCEL_SCELTE))
+        _set(self.llm_tipo_var, "llm_tipo", list(llm.TIPI_NOTA))
+        _set(self.llm_lingua_var, "llm_lingua", list(llm.LINGUE_NOTA))
+        _set(self.llm_ctx_var, "llm_ctx", list(CTX_SCELTE))
+        _set(self.llm_maxout_var, "llm_max_output", MAX_OUTPUT_SCELTE)
+
+        for entry, chiave in ((self.size_entry, "mb_segmento"),
+                              (self.llm_temp_entry, "llm_temperatura")):
+            if imp.get(chiave):
+                entry.delete(0, "end")
+                entry.insert(0, str(imp[chiave]))
+        for var, chiave in ((self.nota_var, "nota"), (self.wiki_var, "wiki_struttura"),
+                            (self.wiki_ingest_var, "wiki_ingest")):
+            if isinstance(imp.get(chiave), bool):
+                var.set(imp[chiave])
+
+        if imp.get("llm_modello"):
+            self.llm_modello_var.set(imp["llm_modello"])
+            self._llm_label_prec = imp["llm_modello"]
+        if imp.get("wiki_cervello"):
+            self.wiki_brain_var.set(imp["wiki_cervello"])
+
+        kb = imp.get("kb_path")
+        if kb and os.path.isdir(kb):
+            self._kb_path = kb
+            self._set_entry(self.entry_kb, kb)
+        cv = imp.get("cartella_video")
+        if cv and os.path.isdir(cv):
+            self._cartella_video_batch = cv
+            self._set_entry(self.entry_cartella_video, cv)
+        self._aggiorna_testo_bottoni()
+
+    def _salva_impostazioni(self):
+        dati = {
+            "whisper_modello": self.modello_var.get(),
+            "whisper_lingua": self.lingua_var.get(),
+            "whisper_formato": self.formato_var.get(),
+            "whisper_device": self.device_var.get(),
+            "whisper_thread": self.whisper_thread_var.get(),
+            "llm_thread": self.llm_thread_var.get(),
+            "llm_accelerazione": self.llm_accel_var.get(),
+            "mb_segmento": self.size_entry.get().strip(),
+            "llm_modello": self.llm_modello_var.get(),
+            "llm_tipo": self.llm_tipo_var.get(),
+            "llm_lingua": self.llm_lingua_var.get(),
+            "llm_ctx": self.llm_ctx_var.get(),
+            "llm_max_output": self.llm_maxout_var.get(),
+            "llm_temperatura": self.llm_temp_entry.get().strip(),
+            "llm_custom": self._modelli_custom,
+            "nota": bool(self.nota_var.get()),
+            "wiki_struttura": bool(self.wiki_var.get()),
+            "wiki_ingest": bool(self.wiki_ingest_var.get()),
+            "wiki_cervello": self.wiki_brain_var.get(),
+            "kb_path": self._kb_path,
+            "cartella_video": self._cartella_video_batch,
+        }
+        try:
+            os.makedirs(llm.APP_DIR, exist_ok=True)
+            with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+                json.dump(dati, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _on_close(self):
+        if self.in_esecuzione and not messagebox.askyesno(
+                "Esci", "Un'elaborazione è in corso. Uscire comunque?\n"
+                        "(Il progresso salvato potrà essere ripreso.)"):
+            return
+        self._salva_impostazioni()
+        self.destroy()
+
+    # ===================================================================
+    # Modelli LLM: elenco, stato, download
+    # ===================================================================
+    def _etichette_modelli(self):
+        self._llm_specs = {}
+        labels = []
+
+        def _aggiungi(spec):
+            if spec["label"] not in self._llm_specs:
+                self._llm_specs[spec["label"]] = spec
+                labels.append(spec["label"])
+
+        for spec in llm.CATALOGO_LLM:
+            _aggiungi(spec)
+        noti = {llm.normalizza_nome_ollama(s["id"])
+                for s in llm.CATALOGO_LLM if s["backend"] == "ollama"}
+        locali = set()
+        for nome in sorted(self._ollama_installati or []):
+            if nome in noti:
+                continue
+            spec = llm.spec_personalizzata(nome)
+            spec["label"] = f"{nome} · Ollama (locale)"
+            locali.add(nome)
+            _aggiungi(spec)
+        for testo in self._modelli_custom:
+            try:
+                spec = llm.spec_personalizzata(testo)
+            except ValueError:
+                continue
+            if spec["backend"] == "ollama" and llm.normalizza_nome_ollama(spec["id"]) in (noti | locali):
+                continue
+            _aggiungi(spec)
+        labels.append(llm.CUSTOM_LABEL)
+        return labels
+
+    def _label_per_spec(self, spec):
+        for label, s in self._llm_specs.items():
+            if s["backend"] == spec["backend"] and (
+                    llm.normalizza_nome_ollama(s["id"]) == llm.normalizza_nome_ollama(spec["id"])
+                    if s["backend"] == "ollama"
+                    else (s["id"], s.get("pattern")) == (spec["id"], spec.get("pattern"))):
+                return label
+        return None
+
+    def _aggiorna_menu_modelli(self):
+        labels = self._etichette_modelli()
+        self.llm_menu.configure(values=labels)
+        self.wiki_brain_menu.configure(
+            values=[BRAIN_UGUALE] + [l for l in labels if l != llm.CUSTOM_LABEL])
+        verifica_in_corso = self._ollama_ok is None
+        if self.llm_modello_var.get() not in self._llm_specs and not verifica_in_corso:
+            self.llm_modello_var.set(llm.DEFAULT_LLM_LABEL)
+            self._llm_label_prec = llm.DEFAULT_LLM_LABEL
+        brain = self.wiki_brain_var.get()
+        if brain != BRAIN_UGUALE and brain not in self._llm_specs and not verifica_in_corso:
+            self.wiki_brain_var.set(BRAIN_UGUALE)
+        self._aggiorna_info_llm()
+
+    def _aggiorna_modelli_locali(self):
+        def lavoro():
+            ok = llm.ollama_raggiungibile()
+            installati = None
+            if ok:
+                try:
+                    installati = set(llm.ollama_modelli_installati())
+                except Exception:
+                    installati = None
+
+            def _fine():
+                self._ollama_ok = ok
+                self._ollama_installati = installati
+                self._aggiorna_menu_modelli()
+            self.after(0, _fine)
+        threading.Thread(target=lavoro, daemon=True).start()
+
+    def _on_llm_scelto(self, label):
+        if label != llm.CUSTOM_LABEL:
+            self._llm_label_prec = label
+            self._aggiorna_info_llm()
+            return
+        dlg = ctk.CTkInputDialog(
+            title="Modello personalizzato",
+            text=("Nome di un modello Ollama, es.\n"
+                  "   qwen3:30b-a3b   ·   mistral-small3.2   ·   deepseek-r1:8b\n\n"
+                  "oppure un GGUF da HuggingFace (richiede llama-cpp-python):\n"
+                  "   hf:<owner>/<repo>[:<pattern>]\n"
+                  "   es. hf:bartowski/Qwen_Qwen3-14B-GGUF:*Q4_K_M.gguf"))
+        testo = (dlg.get_input() or "").strip()
+        if not testo:
+            self.llm_modello_var.set(self._llm_label_prec)
+            return
+        try:
+            spec = llm.spec_personalizzata(testo)
+        except ValueError as e:
+            messagebox.showerror("Errore", str(e))
+            self.llm_modello_var.set(self._llm_label_prec)
+            return
+        if testo not in self._modelli_custom:
+            self._modelli_custom.append(testo)
+        self._aggiorna_menu_modelli()
+        label = self._label_per_spec(spec) or self._llm_label_prec
+        self.llm_modello_var.set(label)
+        self._llm_label_prec = label
+        self._aggiorna_info_llm()
+        self._salva_impostazioni()
+
+    def _aggiorna_info_llm(self):
+        spec = self._llm_specs.get(self.llm_modello_var.get())
+        if not spec:
+            self.llm_info.configure(text="… verifica dei modelli locali in corso")
+            return
+        parti = []
+        if spec["backend"] == "ollama":
+            parti.append("Ollama")
+            if self._ollama_ok is None:
+                stato = "… verifica di Ollama in corso"
+            elif not self._ollama_ok:
+                stato = ("⚠ Ollama non raggiungibile: installalo da ollama.com/download "
+                         "(l'app prova ad avviarlo da sola)")
+            elif llm.normalizza_nome_ollama(spec["id"]) in (self._ollama_installati or set()):
+                stato = "✓ installato"
+            else:
+                stato = "⬇ da scaricare (automatico al primo uso o con '⬇ Scarica')"
+        else:
+            parti.append("HuggingFace GGUF · llama.cpp")
+            if not llm.librerie_hf_disponibili():
+                stato = "⚠ richiede: pip install -r requirements-hf.txt"
+            elif llm.hf_percorso_locale(spec):
+                stato = "✓ scaricato"
+            else:
+                stato = "⬇ da scaricare (automatico al primo uso o con '⬇ Scarica')"
+        if spec.get("size_gb"):
+            parti.append(f"~{spec['size_gb']:g} GB")
+        if spec.get("ctx_max"):
+            parti.append(f"contesto max {spec['ctx_max'] // 1024}K")
+        ctx = CTX_SCELTE.get(self.llm_ctx_var.get(), "auto")
+        if ctx == "auto":
+            parti.append("contesto adattato al testo (≤32K)")
+        else:
+            parti.append(f"KV cache ≈ {llm.stima_kv_gb(ctx):.1f} GB a {ctx // 1024}K (stima)")
+        if spec.get("note"):
+            parti.append(spec["note"])
+        if ACCEL_SCELTE.get(self.llm_accel_var.get()) == "cpu":
+            parti.append("solo CPU")
+        avviso = llm.avviso_ram(spec, ctx if ctx != "auto" else 16384)
+        if avviso:
+            stato += f"   ⚠ {avviso}"
+        self.llm_info.configure(text="  ·  ".join(parti) + "\n" + stato)
+
+    def _scarica_modello_llm(self):
+        if self.in_esecuzione:
+            return
+        spec = self._llm_specs.get(self.llm_modello_var.get())
+        if not spec:
+            messagebox.showerror("Errore", "Seleziona un modello LLM valido.")
+            return
+        self._set_in_esecuzione(True)
+        self._apri_log_file("download_llm")
+        self._log(f"\n{'━'*50}")
+        self._log("⬇  DOWNLOAD MODELLO LLM")
+        self._log(f"{'━'*50}")
+        self._log(f"   {spec['label']}\n")
+        self._log_sistema()
+        self._set_status(f"Download {spec['label']}...")
+
+        def lavoro():
+            try:
+                llm.scarica_modello(spec, self._log, self._set_progress, self.stop_event)
+                self._set_status("Modello LLM pronto")
+            except llm.Interrotto:
+                self._log("⏹  Download interrotto.")
+                self._set_status("Download interrotto")
+            except Exception as e:
+                err = str(e)
+                self._log(f"✗ ERRORE: {err}")
+                self._set_status("Errore download")
+                self.after(0, lambda m=err: messagebox.showerror("Errore", m))
+            finally:
+                self._chiudi_log_file()
+                self._set_in_esecuzione(False)
+                self._aggiorna_modelli_locali()
+
+        threading.Thread(target=lavoro, daemon=True).start()
+
+    def _leggi_config_llm(self, per_wiki=False):
+        """Legge (nel thread GUI) la configurazione LLM. None se non valida."""
+        label = self.llm_modello_var.get()
+        if per_wiki and self.wiki_brain_var.get() != BRAIN_UGUALE:
+            label = self.wiki_brain_var.get()
+        spec = self._llm_specs.get(label)
+        if not spec:
+            messagebox.showerror("Errore", "Seleziona un modello LLM valido nelle Impostazioni.")
+            return None
+        try:
+            temp = float(self.llm_temp_entry.get().strip().replace(",", "."))
+            if not 0 <= temp <= 2:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Errore", "Temperatura non valida: usa un numero tra 0 e 2 (es. 0.3).")
+            return None
+        if spec["backend"] == "hf" and not llm.librerie_hf_disponibili():
+            messagebox.showerror(
+                "Errore", "Per i modelli HuggingFace installa:\n\n"
+                          "  pip install -r requirements-hf.txt\n\n"
+                          "oppure scegli un modello '· Ollama'.")
+            return None
+        return {
+            "spec": dict(spec),
+            "opzioni": {
+                "ctx": CTX_SCELTE.get(self.llm_ctx_var.get(), "auto"),
+                "max_output": int(self.llm_maxout_var.get()),
+                "temperatura": temp,
+                "lingua": self.llm_lingua_var.get(),
+                "num_thread": self._llm_threads(),
+                "gpu": ACCEL_SCELTE.get(self.llm_accel_var.get(), "auto"),
+            },
+            "tipo": self.llm_tipo_var.get(),
+            "kb": self._kb_path,
+        }
+
+    def _llm_kwargs(self):
+        return dict(callback=self._log, stato_cb=self._set_status,
+                    progress_cb=self._set_progress, stop_event=self.stop_event,
+                    pause_event=self.pause_event)
+
+    def _whisper_threads(self):
+        """Thread CPU per faster-whisper (0 = default della libreria)."""
+        v = self.whisper_thread_var.get()
+        return int(v) if v.isdigit() else 0
+
+    def _llm_threads(self):
+        """Thread CPU per l'LLM (0 = scelta automatica del backend)."""
+        v = self.llm_thread_var.get()
+        return int(v) if v.isdigit() else 0
+
+    def _log_sistema(self, whisper=False, cfg_llm=None):
+        """Intestazione hardware/configurazione: rende confrontabili i test di performance."""
+        info = perf.info_sistema()
+        self._log(f"🖥  Sistema: {info['os']} ({info['arch']}) · Python {info['python']}")
+        self._log(f"   CPU: {info['cpu']} · {perf.descrizione_core(info)}"
+                  + (f" · RAM {info['ram_gb']:.0f} GB" if info.get("ram_gb") else ""))
+        if info.get("gpu"):
+            self._log(f"   GPU: {info['gpu']}")
+        if whisper:
+            dev = _risolvi_device(self.device_var.get())
+            n = self._whisper_threads()
+            if dev == "cuda":
+                esec = "GPU CUDA (float16)"
+            else:
+                esec = (f"CPU int8 · {n} thread" if n else
+                        f"CPU int8 · auto = {perf.thread_whisper_effettivi(0)} thread")
+            self._log(f"   Whisper: {self.modello_var.get()} · device {self.device_var.get()} → {esec}")
+        if cfg_llm:
+            o = cfg_llm["opzioni"]
+            ctx = o["ctx"] if o["ctx"] != "auto" else "auto"
+            self._log(f"   LLM: {cfg_llm['spec']['label']} · thread {o['num_thread'] or 'auto'} · "
+                      f"{'solo CPU' if o['gpu'] == 'cpu' else 'GPU se disponibile'} · "
+                      f"contesto {ctx} · max output {o['max_output']} · temp {o['temperatura']}")
+        self._log(f"   Log performance: {perf.PERF_CSV}\n")
+
+    # ===================================================================
+    # Fase LLM: trascrizione → nota (+ archiviazione nella knowledge base)
+    # ===================================================================
+    def _fase_nota(self, percorso_txt, nome_sorgente, cfg):
+        """Eseguita nel thread di lavoro. Ritorna (path_nota, path_pagina_wiki)."""
+        try:
+            with open(percorso_txt, "r", encoding="utf-8") as f:
+                contenuto = f.read()
+        except Exception as e:
+            self._log(f"✗ Impossibile leggere la trascrizione: {e}")
+            return None, None
+        testo = llm.testo_pulito_trascrizione(contenuto)
+        if not testo.strip():
+            self._log("⚠ Trascrizione vuota: nessuna nota generata.")
+            return None, None
+
+        self._log(f"\n{'━'*50}")
+        self._log(f"🧠  NOTA LLM — {cfg['tipo']}")
+        self._log(f"{'━'*50}")
+        self._set_status("Sintesi LLM in corso...")
+        self._set_progress(-1)
+
+        sess = llm.SessioneLLM(cfg["spec"], cfg["opzioni"], **self._llm_kwargs(),
+                               fase="llm_nota", sorgente=nome_sorgente)
+        try:
+            sess.avvia([testo])
+            nota = llm.genera_nota(sess, testo, cfg["tipo"], fonte=nome_sorgente)
+
+            cartella = os.path.dirname(os.path.abspath(percorso_txt))
+            if os.path.basename(cartella) == "raw":   # non sporcare le fonti immutabili
+                cartella = os.path.dirname(cartella)
+            base = re.sub(r"_trascrizione$", "",
+                          os.path.splitext(os.path.basename(percorso_txt))[0])
+            path_nota = os.path.join(cartella, f"{base}_nota.md")
+            with open(path_nota, "w", encoding="utf-8") as f:
+                f.write(nota["md"])
+            self._log(f"\n📝 Nota salvata: {path_nota}")
+
+            path_wiki = None
+            kb = cfg.get("kb")
+            if kb:
+                self._log(f"\n📚 Archiviazione nella knowledge base: {kb}")
+                genera_struttura_wiki(kb, kb, callback=None, voce_log=False)
+                raw_dir = os.path.join(kb, "raw")
+                raw_path = _scrivi_sorgente_wiki(
+                    raw_dir, _prossimo_indice_raw(raw_dir), nome_sorgente, contenuto)
+                self._log(f"  📄 Sorgente: raw/{os.path.basename(raw_path)}")
+                path_wiki = llm.ingest_sorgente(sess, kb, raw_path, cfg["tipo"], nota=nota)
+            return path_nota, path_wiki
+        except llm.Interrotto:
+            self._log("⏹  Sintesi LLM interrotta.")
+            return None, None
+        except Exception as e:
+            err = str(e)
+            self._log(f"✗ ERRORE LLM: {err}")
+            self._log("   La trascrizione è salvata: puoi rigenerare la nota con "
+                      "'📝 Nota da trascrizione…'.")
+            self.after(0, lambda m=err: messagebox.showwarning(
+                "Sintesi LLM non riuscita", f"{m}\n\nLa trascrizione è comunque salvata."))
+            return None, None
+        finally:
+            sess.chiudi()
 
     # ===================================================================
     # Utility
     # ===================================================================
-    # -------------------------------------------------------------------
-    # Logging su file
-    # -------------------------------------------------------------------
     def _apri_log_file(self, etichetta="elaborazione"):
         """Apre un nuovo file di log nella cartella logs/ accanto a main.py."""
         try:
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-            logs_dir = os.path.join(base_dir, "logs")
+            logs_dir = perf.LOGS_DIR
             os.makedirs(logs_dir, exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             nome_file = f"{ts}_{etichetta}.log"
@@ -1418,14 +2237,13 @@ class App(ctk.CTk):
             self._log_file = None
 
     def _log(self, msg):
-        # Scrivi sul file di log (se aperto)
         try:
             if getattr(self, "_log_file", None):
                 ts = datetime.now().strftime("%H:%M:%S")
                 self._log_file.write(f"[{ts}] {msg}\n")
         except Exception:
             pass
-        # Aggiorna la GUI
+
         def _append():
             self.log_text.insert("end", msg + "\n")
             self.log_text.see("end")
@@ -1463,7 +2281,7 @@ class App(ctk.CTk):
             self.pause_event.set()
             self.btn_pausa.configure(text="▶ Riprendi", fg_color=COLORE_VERDE,
                                      hover_color="#1e6b43")
-            self._set_status("In pausa")
+            self._set_status("In pausa (effettiva al termine del passo corrente)")
 
     def _richiedi_stop(self):
         if messagebox.askyesno("Conferma Stop",
@@ -1474,19 +2292,22 @@ class App(ctk.CTk):
             self.stop_event.set()
             self.pause_event.clear()
             self._set_status("Interruzione in corso...")
-            self._log("⏹  Stop richiesto, attendo completamento segmento corrente...")
+            self._log("⏹  Stop richiesto, attendo il completamento del passo corrente...")
+
+    def _aggiorna_stato_bottoni(self, occupato):
+        s = "disabled" if occupato else "normal"
+        wh = s if WHISPER_DISPONIBILE else "disabled"
+        for b in (self.btn_elabora, self.btn_nota_txt, self.btn_ingest_wiki,
+                  self.btn_chiedi_wiki, self.btn_llm_scarica, self.btn_llm_refresh):
+            b.configure(state=s)
+        for b in (self.btn_elabora_e_trascrivi, self.btn_trascrivi,
+                  self.btn_trascrivi_cartella, self.btn_batch):
+            b.configure(state=wh)
 
     def _set_in_esecuzione(self, stato):
         def _update():
             self.in_esecuzione = stato
-            s = "disabled" if stato else "normal"
-            self.btn_elabora.configure(state=s)
-            self.btn_elabora_e_trascrivi.configure(
-                state=s if WHISPER_DISPONIBILE else "disabled")
-            wh_s = s if WHISPER_DISPONIBILE else "disabled"
-            self.btn_trascrivi.configure(state=wh_s)
-            self.btn_trascrivi_cartella.configure(state=wh_s)
-            self.btn_batch.configure(state=wh_s)
+            self._aggiorna_stato_bottoni(stato)
             if stato:
                 self._set_progress(-1)
                 self.stop_event.clear()
@@ -1497,7 +2318,13 @@ class App(ctk.CTk):
             else:
                 self._set_progress(0)
                 self._nascondi_controlli()
+        # Impostiamo subito il flag (evita doppi avvii prima che `after` giri)
+        self.in_esecuzione = stato
         self.after(0, _update)
+
+    def _aggiorna_testo_bottoni(self):
+        testo = "⚡ Elabora + Trascrivi + Nota" if self.nota_var.get() else "⚡ Elabora + Trascrivi"
+        self.btn_elabora_e_trascrivi.configure(text=testo)
 
     def _stampa_report_e2e(self):
         tempo_e2e = self.tempo_splitting + self.tempo_trascrizione
@@ -1521,25 +2348,52 @@ class App(ctk.CTk):
         file_path = filedialog.askopenfilename(
             title="Seleziona file video",
             filetypes=[
-                ("Video files", "*.mp4 *.avi *.mov *.mkv *.wmv *.flv *.webm"),
+                ("Video files", "*.mp4 *.avi *.mov *.mkv *.wmv *.flv *.webm *.m4v"),
                 ("All files", "*.*"),
             ]
         )
         if file_path:
-            self.entry_video.configure(state="normal")
-            self.entry_video.delete(0, "end")
-            self.entry_video.insert(0, file_path)
-            self.entry_video.configure(state="readonly")
+            self._set_entry(self.entry_video, file_path)
             self._video_path = file_path
+
+    def _browse_kb(self):
+        cartella = filedialog.askdirectory(
+            title="Seleziona (o crea) la cartella della knowledge base",
+            initialdir=self._kb_path or os.path.expanduser("~"))
+        if cartella:
+            self._kb_path = cartella
+            self._set_entry(self.entry_kb, cartella)
+            self._salva_impostazioni()
+
+    def _rimuovi_kb(self):
+        self._kb_path = None
+        self._set_entry(self.entry_kb, "")
+        self._salva_impostazioni()
 
     def _browse_cartella_video(self):
         cartella = filedialog.askdirectory(title="Seleziona cartella con i video")
         if cartella:
-            self.entry_cartella_video.configure(state="normal")
-            self.entry_cartella_video.delete(0, "end")
-            self.entry_cartella_video.insert(0, cartella)
-            self.entry_cartella_video.configure(state="readonly")
+            self._set_entry(self.entry_cartella_video, cartella)
             self._cartella_video_batch = cartella
+
+    def _scegli_cartella_wiki(self, titolo):
+        iniziale = self._kb_path or os.path.expanduser("~")
+        if self._cartella_video_batch and not self._kb_path:
+            nome = os.path.basename(os.path.normpath(self._cartella_video_batch))
+            cand = os.path.join(self._cartella_video_batch, f"_Wiki_{nome}")
+            iniziale = cand if os.path.isdir(cand) else self._cartella_video_batch
+        cartella = filedialog.askdirectory(title=titolo, initialdir=iniziale)
+        if not cartella:
+            return None
+        if any(os.path.isdir(os.path.join(cartella, d)) for d in ("raw", "wiki")):
+            return cartella
+        sotto = [d for d in os.listdir(cartella)
+                 if d.startswith("_Wiki_") and os.path.isdir(os.path.join(cartella, d))]
+        if len(sotto) == 1:
+            return os.path.join(cartella, sotto[0])
+        messagebox.showerror("Errore", "La cartella selezionata non sembra una Wiki "
+                                       "(mancano raw/ e wiki/).")
+        return None
 
     # ===================================================================
     # Elaborazione video (singolo)
@@ -1579,7 +2433,7 @@ class App(ctk.CTk):
                 "2. Oppure metti ffmpeg.exe nella cartella dell'eseguibile")
             return
 
-        video_path = getattr(self, '_video_path', None)
+        video_path = self._video_path
         if not video_path or not os.path.exists(video_path):
             messagebox.showerror("Errore", "Seleziona un file video valido.")
             return
@@ -1588,28 +2442,39 @@ class App(ctk.CTk):
         if target_size_mb is None:
             return
 
+        cfg_llm = None
+        if auto_trascrivi and self.nota_var.get():
+            cfg_llm = self._leggi_config_llm()
+            if cfg_llm is None:
+                return
+
+        self._salva_impostazioni()
         self.video_size_mb = get_file_size_mb(video_path)
         self._set_in_esecuzione(True)
 
-        # Apri log file
         etichetta = "elaborazione_trascrizione" if auto_trascrivi else "elaborazione_video"
         self._apri_log_file(etichetta)
 
         modalita = "ELABORAZIONE + TRASCRIZIONE" if auto_trascrivi else "ELABORAZIONE VIDEO"
+        if cfg_llm:
+            modalita += " + NOTA LLM"
         self._log(f"\n{'━'*50}")
         self._log(f"🎬  {modalita}")
         self._log(f"{'━'*50}")
         self._log(f"   File: {os.path.basename(video_path)}")
         self._log(f"   Dimensione: {self.video_size_mb:.1f} MB")
-        if auto_trascrivi:
-            self._log(f"   Modalita': one-click (split → trascrivi)\n")
-        else:
-            self._log("")
+        if cfg_llm:
+            self._log(f"   LLM: {cfg_llm['spec']['label']} · {cfg_llm['tipo']}")
+            if cfg_llm["kb"]:
+                self._log(f"   Knowledge base: {cfg_llm['kb']}")
+        self._log("")
+        self._log_sistema(whisper=auto_trascrivi, cfg_llm=cfg_llm)
 
         lingua = self._get_lingua()
         modello = self.modello_var.get()
         formato = self.formato_var.get()
         device = self.device_var.get()
+        cpu_threads = self._whisper_threads()
 
         def lavoro():
             try:
@@ -1655,19 +2520,29 @@ class App(ctk.CTk):
                         stop_event=self.stop_event,
                         pause_event=self.pause_event,
                         video_size_mb=self.video_size_mb,
-                        tempo_splitting=self.tempo_splitting)
+                        tempo_splitting=self.tempo_splitting,
+                        cpu_threads=cpu_threads)
 
                     self.tempo_trascrizione = tempo_trasc
 
                     if percorso_out:
-                        self._set_status("Elaborazione + Trascrizione completata!")
                         self._stampa_report_e2e()
-                        self._log("\n🟢 App pronta — puoi consultare i log o avviare un'altra trascrizione.")
-                        self.after(0, lambda: messagebox.showinfo("Completato",
-                            f"Processo end-to-end completato!\n\n"
-                            f"Segmenti: {len(segments)}\n"
-                            f"Trascrizione: {percorso_out}\n"
-                            f"Tempo totale: {formatta_tempo(self.tempo_splitting + self.tempo_trascrizione)}"))
+                        nota = wiki = None
+                        if cfg_llm and not self.stop_event.is_set():
+                            nota, wiki = self._fase_nota(
+                                percorso_out, os.path.basename(video_path), cfg_llm)
+                        self._set_status("Completato!" if (nota or not cfg_llm)
+                                         else "Trascrizione completata (nota non generata)")
+                        self._log("\n🟢 App pronta — puoi consultare i log o avviare un'altra elaborazione.")
+                        msg = (f"Processo end-to-end completato!\n\n"
+                               f"Segmenti: {len(segments)}\n"
+                               f"Trascrizione: {percorso_out}\n"
+                               f"Tempo trascrizione: {formatta_tempo(self.tempo_splitting + self.tempo_trascrizione)}")
+                        if nota:
+                            msg += f"\n\nNota: {nota}"
+                        if wiki:
+                            msg += f"\nWiki: {wiki}"
+                        self.after(0, lambda m=msg: messagebox.showinfo("Completato", m))
                     else:
                         if self.stop_event.is_set():
                             self._set_status("Interrotto — progresso e file parziale salvati")
@@ -1676,25 +2551,26 @@ class App(ctk.CTk):
                 elif self.stop_event.is_set():
                     self._set_status("Interrotto dopo splitting")
                     self._log(f"\n✅ Splitting completato. Trascrizione non avviata (interrotto).")
-                    self._log(f"   Riprendi con 'Trascrivi Segmenti' o 'Trascrivi da Cartella'")
+                    self._log(f"   Riprendi con 'Trascrivi segmenti' o 'Da cartella audio…'")
                 else:
                     self._set_status("Splitting completato!")
-                    self._log(f"\n✅ Puoi ora cliccare 'Trascrivi Segmenti'")
+                    self._log(f"\n✅ Puoi ora cliccare 'Trascrivi segmenti'")
                     self.after(0, lambda: messagebox.showinfo("Successo",
                         f"{len(segments)} segmenti creati\n"
                         f"Tempo: {formatta_tempo(self.tempo_splitting)}\n"
                         f"Percorso: {output_dir}"))
             except ImportError as e:
+                err = str(e)
                 self._set_status("Errore trascrizione")
-                self._log(f"\n✗ ERRORE: {e}")
-                self.after(0, lambda: messagebox.showerror("Errore", str(e)))
+                self._log(f"\n✗ ERRORE: {err}")
+                self.after(0, lambda m=err: messagebox.showerror("Errore", m))
             except Exception as e:
                 self._set_status("Errore")
                 err = str(e)
                 if "'NoneType'" in err:
                     err = "FFmpeg non trovato o non configurato."
                 self._log(f"✗ ERRORE: {err}")
-                self.after(0, lambda: messagebox.showerror("Errore", err))
+                self.after(0, lambda m=err: messagebox.showerror("Errore", m))
             finally:
                 self._chiudi_log_file()
                 self._set_in_esecuzione(False)
@@ -1706,11 +2582,9 @@ class App(ctk.CTk):
     # ===================================================================
     def _get_lingua(self):
         sel = self.lingua_var.get()
-        if sel.startswith("it"):
-            return "it"
-        elif sel.startswith("en"):
-            return "en"
-        return None
+        if sel.startswith("Auto"):
+            return None
+        return sel.split(" ")[0]
 
     def _trascrivi_segmenti(self):
         if self.in_esecuzione:
@@ -1718,7 +2592,7 @@ class App(ctk.CTk):
         if not self.cartella_segmenti or not os.path.isdir(self.cartella_segmenti):
             messagebox.showwarning("Attenzione",
                 "Nessuna cartella disponibile.\n"
-                "Elabora prima un video o usa 'Trascrivi da Cartella...'.")
+                "Elabora prima un video o usa 'Da cartella audio…'.")
             return
         self._esegui_trascrizione(self.cartella_segmenti)
 
@@ -1731,20 +2605,28 @@ class App(ctk.CTk):
             self._esegui_trascrizione(cartella)
 
     def _esegui_trascrizione(self, cartella):
+        cfg_llm = None
+        if self.nota_var.get():
+            cfg_llm = self._leggi_config_llm()
+            if cfg_llm is None:
+                return
+        self._salva_impostazioni()
         self._set_in_esecuzione(True)
-        # Apri log file (solo se non già aperto da _avvia_elaborazione_video)
         if not getattr(self, "_log_file", None):
             self._apri_log_file("trascrizione")
         self._log(f"\n{'━'*50}")
-        self._log(f"🎙  TRASCRIZIONE")
+        self._log(f"🎙  TRASCRIZIONE" + (" + NOTA LLM" if cfg_llm else ""))
         self._log(f"{'━'*50}")
         self._log(f"   Cartella: {cartella}\n")
+        self._log_sistema(whisper=True, cfg_llm=cfg_llm)
         self._set_status("Trascrizione in corso...")
 
         lingua = self._get_lingua()
         modello = self.modello_var.get()
         formato = self.formato_var.get()
         device = self.device_var.get()
+        cpu_threads = self._whisper_threads()
+        nome_sorgente = os.path.basename(os.path.normpath(cartella))
 
         def lavoro():
             try:
@@ -1753,26 +2635,74 @@ class App(ctk.CTk):
                     lingua=lingua, device=device, formato=formato,
                     callback=self._log,
                     stop_event=self.stop_event,
-                    pause_event=self.pause_event)
+                    pause_event=self.pause_event,
+                    cpu_threads=cpu_threads)
 
                 self.tempo_trascrizione = tempo_trasc
 
                 if percorso_out:
-                    self._set_status("Trascrizione completata!")
                     if self.tempo_splitting > 0 and self.video_size_mb > 0:
                         self._stampa_report_e2e()
-                    self._log("\n🟢 App pronta — puoi consultare i log o avviare un'altra trascrizione.")
-                    self.after(0, lambda: messagebox.showinfo("Completato",
-                        f"Trascrizione salvata in:\n{percorso_out}"))
+                    nota = wiki = None
+                    if cfg_llm and not self.stop_event.is_set():
+                        nota, wiki = self._fase_nota(percorso_out, nome_sorgente, cfg_llm)
+                    self._set_status("Completato!" if (nota or not cfg_llm)
+                                     else "Trascrizione completata (nota non generata)")
+                    self._log("\n🟢 App pronta — puoi consultare i log o avviare un'altra elaborazione.")
+                    msg = f"Trascrizione salvata in:\n{percorso_out}"
+                    if nota:
+                        msg += f"\n\nNota:\n{nota}"
+                    if wiki:
+                        msg += f"\n\nWiki:\n{wiki}"
+                    self.after(0, lambda m=msg: messagebox.showinfo("Completato", m))
                 else:
                     if self.stop_event.is_set():
                         self._set_status("Interrotto — progresso e file parziale salvati")
                     else:
                         self._set_status("Nessun file trascritto")
             except Exception as e:
+                err = str(e)
                 self._set_status("Errore trascrizione")
-                self._log(f"\n✗ ERRORE: {e}")
-                self.after(0, lambda: messagebox.showerror("Errore", str(e)))
+                self._log(f"\n✗ ERRORE: {err}")
+                self.after(0, lambda m=err: messagebox.showerror("Errore", m))
+            finally:
+                self._chiudi_log_file()
+                self._set_in_esecuzione(False)
+
+        threading.Thread(target=lavoro, daemon=True).start()
+
+    def _nota_da_file(self):
+        if self.in_esecuzione:
+            return
+        path = filedialog.askopenfilename(
+            title="Seleziona una trascrizione",
+            filetypes=[("Trascrizioni", "*.txt *.md"), ("Tutti i file", "*.*")])
+        if not path:
+            return
+        cfg = self._leggi_config_llm()
+        if cfg is None:
+            return
+        self._salva_impostazioni()
+        self._set_in_esecuzione(True)
+        self._apri_log_file("nota_llm")
+        self._log(f"\n{'━'*50}")
+        self._log("📝  NOTA DA TRASCRIZIONE")
+        self._log(f"{'━'*50}")
+        self._log(f"   File: {path}")
+        self._log_sistema(cfg_llm=cfg)
+
+        def lavoro():
+            try:
+                nota, wiki = self._fase_nota(path, os.path.basename(path), cfg)
+                if nota:
+                    self._set_status("Nota generata!")
+                    msg = f"Nota salvata in:\n{nota}"
+                    if wiki:
+                        msg += f"\n\nArchiviata nella Wiki:\n{wiki}"
+                    self.after(0, lambda m=msg: messagebox.showinfo("Completato", m))
+                else:
+                    self._set_status("Interrotto" if self.stop_event.is_set()
+                                     else "Nota non generata")
             finally:
                 self._chiudi_log_file()
                 self._set_in_esecuzione(False)
@@ -1796,7 +2726,7 @@ class App(ctk.CTk):
                 "2. Oppure metti ffmpeg.exe nella cartella dell'eseguibile")
             return
 
-        cartella = getattr(self, "_cartella_video_batch", None)
+        cartella = self._cartella_video_batch
         if not cartella or not os.path.isdir(cartella):
             messagebox.showerror("Errore", "Seleziona una cartella valida con i video.")
             return
@@ -1812,22 +2742,33 @@ class App(ctk.CTk):
             return
 
         genera_wiki = bool(self.wiki_var.get())
+        cfg_llm = None
+        if genera_wiki and self.wiki_ingest_var.get():
+            cfg_llm = self._leggi_config_llm(per_wiki=True)
+            if cfg_llm is None:
+                return
+
         lingua = self._get_lingua()
         modello = self.modello_var.get()
         formato = self.formato_var.get()
         device = self.device_var.get()
+        cpu_threads = self._whisper_threads()
 
         # Reset metriche E2E (non significative in batch multi-video)
         self.tempo_splitting = 0.0
         self.video_size_mb = 0.0
 
+        self._salva_impostazioni()
         self._set_in_esecuzione(True)
         self._apri_log_file("batch_wiki")
         self._log(f"\n{'━'*50}")
         self._log(f"🚀  BATCH CARTELLA → LLM WIKI")
         self._log(f"{'━'*50}")
         self._log(f"   Video da processare: {len(video)}")
-        self._log(f"   Genera Wiki:         {'sì' if genera_wiki else 'no'}\n")
+        self._log(f"   Genera Wiki:         {'sì' if genera_wiki else 'no'}")
+        self._log(f"   Cervello Wiki:       "
+                  f"{cfg_llm['spec']['label'] + ' · ' + cfg_llm['tipo'] if cfg_llm else 'nessuno (solo trascrizioni)'}\n")
+        self._log_sistema(whisper=True, cfg_llm=cfg_llm)
         self._set_status("Batch in corso...")
 
         def lavoro():
@@ -1837,13 +2778,31 @@ class App(ctk.CTk):
                     modello=modello, lingua=lingua, device=device,
                     formato=formato, genera_wiki=genera_wiki,
                     callback=self._log,
-                    stop_event=self.stop_event, pause_event=self.pause_event)
+                    stop_event=self.stop_event, pause_event=self.pause_event,
+                    cpu_threads=cpu_threads)
 
                 if not risultato:
                     self._set_status("Nessun video elaborato")
                     return
 
                 cp = risultato["cartella_progetto"]
+                ingest = None
+                if cfg_llm and risultato["wiki_pronta"] and not risultato["interrotto"]:
+                    self._log(f"\n{'━'*50}")
+                    self._log("🧠  INGEST WIKI CON LLM")
+                    self._log(f"{'━'*50}")
+                    self._set_status("Ingest Wiki con LLM...")
+                    self._set_progress(-1)
+                    try:
+                        ingest = llm.ingest_cartella_wiki(
+                            cp, cfg_llm["spec"], cfg_llm["opzioni"], cfg_llm["tipo"],
+                            **self._llm_kwargs())
+                    except Exception as e:
+                        err = str(e)
+                        self._log(f"✗ ERRORE INGEST LLM: {err}")
+                        self._log("   Le trascrizioni sono salvate: riprova con '🧠 Ingest Wiki esistente…'.")
+                        self.after(0, lambda m=err: messagebox.showwarning("Ingest LLM non riuscito", m))
+
                 self._log(f"\n{'━'*50}")
                 self._log(f"📋  REPORT BATCH")
                 self._log(f"{'━'*50}")
@@ -1851,25 +2810,27 @@ class App(ctk.CTk):
                 self._log(f"   Completati (tot):    {risultato['n_completati']}")
                 self._log(f"   Nuovi in questo run: {risultato['n_nuovi']}")
                 self._log(f"   Tempo batch:         {formatta_tempo(risultato['tempo'])}")
+                if ingest:
+                    self._log(f"   Sorgenti in wiki:    +{ingest['n_nuovi']} (totale sorgenti {ingest['n_tot']})")
                 self._log(f"   Progetto:            {cp}")
                 self._log(f"{'━'*50}")
 
-                if risultato["interrotto"]:
+                interrotto = risultato["interrotto"] or bool(ingest and ingest["interrotto"])
+                if interrotto:
                     self._set_status("Batch interrotto — progresso salvato")
                     self._log("\n⏹  Interrotto. Riavvia il batch sulla stessa cartella per riprendere.")
                 elif risultato["wiki_pronta"]:
                     self._set_status("Batch + Wiki completati!")
                     self._log(f"\n📚 LLM Wiki pronta.")
                     self._log(f"   1) Apri '{os.path.basename(cp)}' come vault in Obsidian")
-                    self._log(f"   2) Apri un agente (es. Claude Code) nella stessa cartella")
-                    self._log(f"   3) Chiedi: \"Leggi CLAUDE.md e fai l'ingest delle sorgenti in raw/\"")
+                    self._log(f"   2) Usa '💬 Chiedi alla Wiki…' oppure un agente (es. Claude Code)")
                     self._log("\n🟢 App pronta.")
-                    self.after(0, lambda: messagebox.showinfo("Completato",
-                        f"Batch completato!\n\n"
-                        f"Video completati: {risultato['n_completati']}/{risultato['n_video']}\n"
-                        f"Progetto Wiki:\n{cp}\n\n"
-                        f"Apri la cartella in Obsidian e usa un agente LLM "
-                        f"(vedi CLAUDE.md) per costruire la wiki."))
+                    msg = (f"Batch completato!\n\n"
+                           f"Video completati: {risultato['n_completati']}/{risultato['n_video']}\n")
+                    if ingest:
+                        msg += f"Sorgenti sintetizzate ora: {ingest['n_nuovi']}\n"
+                    msg += f"\nProgetto Wiki:\n{cp}\n\nAprila in Obsidian come vault."
+                    self.after(0, lambda m=msg: messagebox.showinfo("Completato", m))
                 else:
                     self._set_status("Batch completato (senza Wiki)")
                     self.after(0, lambda: messagebox.showinfo("Completato",
@@ -1877,9 +2838,106 @@ class App(ctk.CTk):
                         f"Video completati: {risultato['n_completati']}/{risultato['n_video']}\n"
                         f"Trascrizioni nelle sottocartelle di:\n{cp}"))
             except Exception as e:
+                err = str(e)
                 self._set_status("Errore batch")
-                self._log(f"\n✗ ERRORE BATCH: {e}")
-                self.after(0, lambda: messagebox.showerror("Errore", str(e)))
+                self._log(f"\n✗ ERRORE BATCH: {err}")
+                self.after(0, lambda m=err: messagebox.showerror("Errore", m))
+            finally:
+                self._chiudi_log_file()
+                self._set_in_esecuzione(False)
+
+        threading.Thread(target=lavoro, daemon=True).start()
+
+    # ===================================================================
+    # Wiki esistente: ingest e domande
+    # ===================================================================
+    def _ingest_wiki_esistente(self):
+        if self.in_esecuzione:
+            return
+        cartella = self._scegli_cartella_wiki("Seleziona la cartella della Wiki (contiene raw/)")
+        if not cartella:
+            return
+        cfg = self._leggi_config_llm(per_wiki=True)
+        if cfg is None:
+            return
+        self._salva_impostazioni()
+        self._set_in_esecuzione(True)
+        self._apri_log_file("ingest_wiki")
+        self._log(f"\n{'━'*50}")
+        self._log("🧠  INGEST WIKI")
+        self._log(f"{'━'*50}")
+        self._log(f"   Wiki: {cartella}")
+        self._log(f"   Cervello: {cfg['spec']['label']} · {cfg['tipo']}\n")
+        self._log_sistema(cfg_llm=cfg)
+        self._set_status("Ingest Wiki con LLM...")
+
+        def lavoro():
+            try:
+                res = llm.ingest_cartella_wiki(cartella, cfg["spec"], cfg["opzioni"],
+                                               cfg["tipo"], **self._llm_kwargs())
+                if res["interrotto"]:
+                    self._set_status("Ingest interrotto — riprendi quando vuoi")
+                else:
+                    self._set_status("Ingest completato!")
+                    msg = (f"Ingest completato.\n\nSorgenti sintetizzate ora: {res['n_nuovi']}\n"
+                           f"Sorgenti totali: {res['n_tot']}\n\nWiki: {cartella}")
+                    self.after(0, lambda m=msg: messagebox.showinfo("Completato", m))
+            except Exception as e:
+                err = str(e)
+                self._set_status("Errore ingest")
+                self._log(f"\n✗ ERRORE: {err}")
+                self.after(0, lambda m=err: messagebox.showerror("Errore", m))
+            finally:
+                self._chiudi_log_file()
+                self._set_in_esecuzione(False)
+
+        threading.Thread(target=lavoro, daemon=True).start()
+
+    def _chiedi_alla_wiki(self):
+        if self.in_esecuzione:
+            return
+        cartella = self._scegli_cartella_wiki("Seleziona la Wiki da interrogare")
+        if not cartella:
+            return
+        cfg = self._leggi_config_llm(per_wiki=True)
+        if cfg is None:
+            return
+        dlg = ctk.CTkInputDialog(
+            title="Chiedi alla Wiki",
+            text=f"Wiki: {os.path.basename(os.path.normpath(cartella))}\n\nScrivi la tua domanda:")
+        domanda = (dlg.get_input() or "").strip()
+        if not domanda:
+            return
+        self._salva_impostazioni()
+        self._set_in_esecuzione(True)
+        self._apri_log_file("domanda_wiki")
+        self._log(f"\n{'━'*50}")
+        self._log("💬  DOMANDA ALLA WIKI")
+        self._log(f"{'━'*50}")
+        self._log(f"   {domanda}\n")
+        self._log_sistema(cfg_llm=cfg)
+        self._set_status("Il cervello sta leggendo la Wiki...")
+
+        def lavoro():
+            try:
+                risposta, path, _ = llm.chiedi_alla_wiki(
+                    cartella, domanda, cfg["spec"], cfg["opzioni"], **self._llm_kwargs())
+                self._log(f"\n{'─'*50}")
+                self._log("💬 RISPOSTA")
+                self._log(f"{'─'*50}")
+                self._log(risposta)
+                self._log(f"\n💾 Salvata nella Wiki: {path}")
+                self._set_status("Risposta pronta (salvata nella Wiki)")
+                self.after(0, lambda m=path: messagebox.showinfo(
+                    "Risposta pronta", f"La risposta è nel log ed è stata archiviata in:\n{m}"))
+            except llm.Interrotto:
+                self._log("⏹  Domanda interrotta.")
+                self._set_status("Interrotto")
+            except Exception as e:
+                err = str(e)
+                self._set_status("Errore")
+                self._log(f"\n✗ ERRORE: {err}")
+                self.after(0, lambda m=err: messagebox.showerror("Errore", m))
             finally:
                 self._chiudi_log_file()
                 self._set_in_esecuzione(False)

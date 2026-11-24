@@ -1,0 +1,18 @@
+# =====================================================================
+# Dipendenze opzionali — LLM da HuggingFace (GGUF) via llama.cpp
+# =====================================================================
+# NON servono se usi i modelli "· Ollama" (backend consigliato): in quel
+# caso basta installare Ollama da https://ollama.com/download.
+#
+# Installazione:
+#   pip install -r requirements-hf.txt
+#
+# macOS (Apple Silicon): la wheel di llama-cpp-python usa Metal di default.
+# GPU NVIDIA: per l'offload su CUDA ricompila con
+#   CMAKE_ARGS="-DGGML_CUDA=on" pip install --force-reinstall --no-cache-dir llama-cpp-python
+# Windows: serve "Desktop development with C++" (Visual Studio Build Tools)
+#   se non è disponibile una wheel precompilata per la tua versione di Python.
+# =====================================================================
+
+llama-cpp-python>=0.3.0
+huggingface_hub>=0.23.0

@@ -37,6 +37,7 @@ import time
 import fnmatch
 import shutil
 import subprocess
+import threading
 import unicodedata
 import urllib.request
 import urllib.error
@@ -530,36 +531,72 @@ class OllamaBackend:
     def scarica(self, log, progress_cb=None, stop_event=None):
         assicura_server_ollama(log)
         payload = {"model": self.model, "name": self.model, "stream": True}
-        ultimo_stato, ultimo_pct, digest = None, -10, None
+        log("   (non chiudere l'app durante il download: Ollama lo interrompe; "
+            "riaprendo riprende da dove si era fermato)")
+        ultimo_stato, digest = None, None
+        stato_dl = {"t_dato": time.time(), "attivo": True, "avvisato": False}
+        rif = {"t": 0.0, "pct": -5, "fatto": 0, "t_vel": time.time(), "fatto_vel": 0, "vel": 0.0}
+
+        def _watchdog():
+            # Se la rete si blocca lo stream non manda righe: avvisa dopo 60 s
+            while stato_dl["attivo"]:
+                time.sleep(5)
+                fermo = time.time() - stato_dl["t_dato"]
+                if stato_dl["attivo"] and fermo > 60 and not stato_dl["avvisato"]:
+                    stato_dl["avvisato"] = True
+                    log(f"  ⚠ Nessun dato ricevuto da {fermo:.0f} s: rete lenta o bloccata "
+                        "(VPN/proxy?). Il download riprende appena la connessione torna.")
+
         try:
             resp = _http_stream("/api/pull", payload)
         except urllib.error.HTTPError as e:
             raise ErroreLLM(f"Download '{self.model}' fallito: {_errore_http(e)}")
-        with resp:
-            for raw in resp:
-                if stop_event is not None and stop_event.is_set():
-                    raise Interrotto()
-                riga = raw.decode("utf-8", errors="replace").strip()
-                if not riga:
-                    continue
-                obj = json.loads(riga)
-                if obj.get("error"):
-                    raise ErroreLLM(f"Download '{self.model}' fallito: {obj['error']}")
-                stato = obj.get("status", "")
-                tot, fatto = obj.get("total"), obj.get("completed")
-                if tot and fatto is not None:
-                    if obj.get("digest") != digest:
-                        digest, ultimo_pct = obj.get("digest"), -10
-                    frac = fatto / tot
-                    if progress_cb:
-                        progress_cb(frac)
-                    pct = int(frac * 100)
-                    if pct >= ultimo_pct + 10:
-                        ultimo_pct = pct - pct % 10
-                        log(f"  ⬇ {pct:3d}%  di {tot / 1e9:.2f} GB")
-                elif stato and stato != ultimo_stato:
-                    log(f"  · {stato}")
-                ultimo_stato = stato
+        threading.Thread(target=_watchdog, daemon=True).start()
+        try:
+            with resp:
+                for raw in resp:
+                    if stop_event is not None and stop_event.is_set():
+                        raise Interrotto()
+                    riga = raw.decode("utf-8", errors="replace").strip()
+                    if not riga:
+                        continue
+                    obj = json.loads(riga)
+                    if obj.get("error"):
+                        raise ErroreLLM(f"Download '{self.model}' fallito: {obj['error']}")
+                    stato = obj.get("status", "")
+                    tot, fatto = obj.get("total"), obj.get("completed")
+                    if tot and fatto is not None:
+                        ora = time.time()
+                        if obj.get("digest") != digest:
+                            digest = obj.get("digest")
+                            rif.update(t=0.0, pct=-5, t_vel=ora, fatto_vel=fatto, vel=0.0)
+                        if fatto != rif["fatto"]:
+                            stato_dl["t_dato"] = ora
+                            if stato_dl["avvisato"]:
+                                stato_dl["avvisato"] = False
+                                log("  ✓ Il download è ripartito")
+                        rif["fatto"] = fatto
+                        if ora - rif["t_vel"] >= 3:      # velocità su finestre di ~3 s
+                            rif["vel"] = (fatto - rif["fatto_vel"]) / (ora - rif["t_vel"])
+                            rif["t_vel"], rif["fatto_vel"] = ora, fatto
+                        frac = fatto / tot
+                        if progress_cb:
+                            progress_cb(frac)
+                        pct = int(frac * 100)
+                        if tot > 50e6 and (pct >= rif["pct"] + 5 or ora - rif["t"] >= 20 or fatto >= tot):
+                            rif["t"], rif["pct"] = ora, pct - pct % 5
+                            dettaglio = ""
+                            if rif["vel"] > 0 and fatto < tot:
+                                resta = (tot - fatto) / rif["vel"]
+                                dettaglio = (f" · {rif['vel'] / 1e6:.1f} MB/s · restano "
+                                             f"~{resta / 60:.0f} min" if resta >= 90 else
+                                             f" · {rif['vel'] / 1e6:.1f} MB/s · restano ~{resta:.0f} s")
+                            log(f"  ⬇ {pct:3d}%  {fatto / 1e6:.0f} / {tot / 1e6:.0f} MB{dettaglio}")
+                    elif stato and stato != ultimo_stato:
+                        log(f"  · {stato}")
+                    ultimo_stato = stato
+        finally:
+            stato_dl["attivo"] = False
         log(f"✓ Modello '{self.model}' pronto in Ollama")
 
     # --- contesto / caricamento -----------------------------------------

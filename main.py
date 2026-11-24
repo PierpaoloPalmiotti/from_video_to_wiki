@@ -1352,25 +1352,23 @@ class App(ctk.CTk):
         self._ollama_installati = None   # set di nomi normalizzati
         self._llm_label_prec = llm.DEFAULT_LLM_LABEL
 
-        # Grid principale: la riga del log si espande
+        # Grid principale: header fisso, pagina scorrevole (impostazioni,
+        # sezioni operative e log), status bar fissa.
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(3, weight=1)
+        self.grid_rowconfigure(1, weight=1)
 
         self._crea_header()
-        if self._schermo_piccolo:
-            # Schermi bassi (es. laptop Windows 1080p al 125-150%): i blocchi
-            # superiori diventano scorrevoli e il log resta sempre visibile.
-            contenitore = ctk.CTkScrollableFrame(self, fg_color="transparent",
-                                                 height=self._altezza_scroll)
-            contenitore.grid(row=1, column=0, rowspan=2, padx=0, pady=0, sticky="nsew")
-            contenitore.grid_columnconfigure(0, weight=1)
-            self._crea_sezione_impostazioni(contenitore, 0)
-            self._crea_sezioni_operative(contenitore, 1)
-        else:
-            self._crea_sezione_impostazioni(self, 1)
-            self._crea_sezioni_operative(self, 2)
-        self._crea_sezione_log()
+        # Tutta l'interfaccia scorre con la barra laterale: le sezioni in alto
+        # restano nella loro forma, il log sotto è alto quanto la finestra.
+        self.pagina = ctk.CTkScrollableFrame(self, fg_color="transparent", corner_radius=0)
+        self.pagina.grid(row=1, column=0, padx=0, pady=0, sticky="nsew")
+        self.pagina.grid_columnconfigure(0, weight=1)
+        self._crea_sezione_impostazioni(self.pagina, 0)
+        self._crea_sezioni_operative(self.pagina, 1)
+        self._crea_sezione_log(self.pagina, 2)
         self._crea_status_bar()
+        self._altezza_log_corrente = None
+        self.bind("<Configure>", self._pianifica_adatta_log, add="+")
 
         self._applica_impostazioni()
         self._aggiorna_menu_modelli()
@@ -1389,11 +1387,68 @@ class App(ctk.CTk):
         sw = int(self.winfo_screenwidth() / scala)
         sh = int(self.winfo_screenheight() / scala)
         w = max(900, min(1280, sw - 40))
-        h = max(600, min(880, sh - 90))
+        h = max(560, min(1000, sh - 90))
         self.geometry(f"{w}x{h}")
-        self.minsize(min(1100, w), min(640, h))
-        self._schermo_piccolo = sh < 960
-        self._altezza_scroll = max(280, h - 330)
+        # La pagina scorre: la finestra può essere anche bassa
+        self.minsize(min(1100, w), min(480, h))
+
+    # -------------------------------------------------------------------
+    # Navigazione nella pagina scorrevole
+    # -------------------------------------------------------------------
+    def _scorri_a(self, frazione):
+        try:
+            self.pagina._parent_canvas.yview_moveto(frazione)
+        except Exception:
+            pass
+
+    def _vai_al_log(self):
+        self.update_idletasks()
+        self._scorri_a(1.0)
+
+    def _vai_in_alto(self):
+        self._scorri_a(0.0)
+
+    def _pianifica_adatta_log(self, event=None):
+        if event is not None and event.widget is not self:
+            return
+        if getattr(self, "_job_adatta_log", None):
+            self.after_cancel(self._job_adatta_log)
+        self._job_adatta_log = self.after(120, self._adatta_altezza_log)
+
+    def _adatta_altezza_log(self):
+        """Il log occupa tutta l'altezza visibile della pagina (meno la sua
+        intestazione): scorrendo in basso lo si vede per intero."""
+        self._job_adatta_log = None
+        try:
+            scala = float(ctk.ScalingTracker.get_widget_scaling(self)) or 1.0
+        except Exception:
+            scala = 1.0
+        # Altezza dell'area visibile (il canvas), non del contenuto che scorre
+        try:
+            visibile = self.pagina._parent_canvas.winfo_height() / scala
+        except Exception:
+            visibile = (self.winfo_height() - 80) / scala
+        nuova = int(max(260, visibile - 95))
+        if nuova != self._altezza_log_corrente:
+            self._altezza_log_corrente = nuova
+            self.log_text.configure(height=nuova)
+
+    def _rotella_log(self, event):
+        """Rotella sul log: scorre il log; ai suoi estremi lascia scorrere la pagina."""
+        tb = self.log_text._textbox
+        if getattr(event, "num", None) in (4, 5):        # Linux
+            passi = -3 if event.num == 4 else 3
+        elif SU_MAC:
+            passi = -event.delta
+        else:
+            passi = -int(event.delta / 120) * 3
+        if passi == 0:
+            return "break"
+        inizio, fine = tb.yview()
+        if (passi < 0 and inizio <= 0.0) or (passi > 0 and fine >= 1.0):
+            return None                  # log al limite: scorre la pagina
+        tb.yview_scroll(passi, "units")
+        return "break"
 
     def _carica_info_sistema(self):
         def lavoro():
@@ -1469,6 +1524,7 @@ class App(ctk.CTk):
             font=ctk.CTkFont(size=12),
             selected_color=COLORE_ACCENT,
         ).pack(side="right")
+        self._bottone_grigio(header, "⤓ Log", self._vai_al_log, 70).pack(side="right", padx=(0, 10))
         self.lbl_sistema = ctk.CTkLabel(header, text="🖥  …", text_color=COLORE_TESTO_DIM,
                                         font=ctk.CTkFont(size=11))
         self.lbl_sistema.pack(side="right", padx=(0, 14), pady=(6, 0))
@@ -1733,9 +1789,9 @@ class App(ctk.CTk):
     # -------------------------------------------------------------------
     # Log + Progress + Controlli Pausa/Stop
     # -------------------------------------------------------------------
-    def _crea_sezione_log(self):
-        frame = ctk.CTkFrame(self)
-        frame.grid(row=3, column=0, padx=20, pady=5, sticky="nsew")
+    def _crea_sezione_log(self, parent, row):
+        frame = ctk.CTkFrame(parent)
+        frame.grid(row=row, column=0, padx=20, pady=(5, 10), sticky="nsew")
         frame.grid_rowconfigure(2, weight=1)
         frame.grid_columnconfigure(0, weight=1)
 
@@ -1743,12 +1799,18 @@ class App(ctk.CTk):
         top_row.grid(row=0, column=0, padx=15, pady=(10, 5), sticky="ew")
         top_row.grid_columnconfigure(1, weight=1)
 
+        sinistra = ctk.CTkFrame(top_row, fg_color="transparent", height=30)
+        sinistra.grid(row=0, column=0, sticky="w")
         ctk.CTkLabel(
-            top_row, text="Log",
+            sinistra, text="Log",
             font=ctk.CTkFont(size=13, weight="bold"),
-        ).grid(row=0, column=0, sticky="w")
+        ).pack(side="left")
+        self._bottone_grigio(sinistra, "⤒ Torna su", self._vai_in_alto, 90).pack(side="left", padx=(12, 0))
+        self._bottone_grigio(sinistra, "🧹 Pulisci", lambda: self.log_text.delete("1.0", "end"),
+                             90).pack(side="left", padx=(6, 0))
 
-        self.ctrl_frame = ctk.CTkFrame(top_row, fg_color="transparent")
+        # height esplicita: un CTkFrame vuoto (Pausa/Stop nascosti) sarebbe alto 200 px
+        self.ctrl_frame = ctk.CTkFrame(top_row, fg_color="transparent", height=30)
         self.ctrl_frame.grid(row=0, column=1, sticky="e")
 
         self.btn_pausa = ctk.CTkButton(
@@ -1772,9 +1834,12 @@ class App(ctk.CTk):
             frame, font=ctk.CTkFont(family=FONT_LOG, size=12),
             activate_scrollbars=True, wrap="word",
             fg_color=COLORE_SFONDO_LOG, text_color=COLORE_TESTO_LOG,
-            corner_radius=8, height=110,
+            corner_radius=8, height=420,
         )
         self.log_text.grid(row=2, column=0, padx=15, pady=(0, 12), sticky="nsew")
+        for evento in (("<Button-4>", "<Button-5>") if sys.platform.startswith("linux")
+                       else ("<MouseWheel>",)):
+            self.log_text._textbox.bind(evento, self._rotella_log, add="+")
         try:  # il tk.Text interno chiede 24 righe: lasciamo che sia la griglia a espanderlo
             self.log_text._textbox.configure(height=4)
         except Exception:
@@ -1786,7 +1851,7 @@ class App(ctk.CTk):
             font=ctk.CTkFont(size=11),
             text_color=COLORE_TESTO_DIM, anchor="w",
         )
-        self.status_label.grid(row=4, column=0, padx=20, pady=(0, 8), sticky="ew")
+        self.status_label.grid(row=2, column=0, padx=20, pady=(2, 6), sticky="ew")
 
     # ===================================================================
     # Impostazioni persistenti
@@ -2315,6 +2380,7 @@ class App(ctk.CTk):
                 self.btn_pausa.configure(text="⏸ Pausa", fg_color=COLORE_GIALLO,
                                          hover_color="#9a7209")
                 self._mostra_controlli()
+                self.after(150, self._vai_al_log)
             else:
                 self._set_progress(0)
                 self._nascondi_controlli()
